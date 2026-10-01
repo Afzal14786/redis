@@ -1,9 +1,13 @@
 
-#include "include/RedisServer.h"
+#include "../include/RedisServer.h"
+#include "../include/RedisCommandHandler.h"
 #include <iostream>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <thread>
+#include <vector>
+#include <cstring>
 
 /**
  * Global pointer for signal handling
@@ -59,4 +63,36 @@ void RedisServer::run() {
     }
 
     std::cout <<  "Redis server is listining on Port " << port << "\n";
+
+    std::vector<std::thread> threads;  // this is for handling multiple clients
+    RedisCommandHandler cmdHandler;
+
+    // till the server is running
+    while (running) {
+        int client_socket = accept(server_socket, nullptr, nullptr);
+        if (client_socket < 0) {
+            if (running)
+                std::cerr << "Error : Accepting client connection.\n";
+            break;
+        }
+
+        threads.emplace_back([client_socket, &cmdHandler]() {
+            char buffer[1024];
+            while (true) {
+                memset(buffer, 0, sizeof(buffer));
+                int bytes = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+                if (bytes <= 0) break;
+                std::string request(buffer, bytes);
+                std::string response = cmdHandler.processCommand(request);
+                send(client_socket, response.c_str(), response.size(), 0);  // send the response to the client 
+            }
+            close(client_socket);  // closing the connection
+        });
+    }
+
+    for (auto &t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    // shutdown
 }
