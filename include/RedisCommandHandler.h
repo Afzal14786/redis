@@ -4,9 +4,9 @@
 #include <iostream>
 #include <string>
 
-class RedisClassHandler {
+class RedisCommandHandler {
 public:
-    RedisClassHandler();
+    RedisCommandHandler();
     // process a command from client and retrun RESP formatted response
     std::string processCommand(const std::string &commandLine);
 private:
