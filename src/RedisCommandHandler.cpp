@@ -53,9 +53,9 @@ std::vector<std::string> parseRespCommands(const std::string &input) {
 }
 
 
-RedisClassHandler::RedisClassHandler(){}
+RedisCommandHandler::RedisCommandHandler(){}
 
-std::string RedisClassHandler::processCommand(const std::string &commandLine) {
+std::string RedisCommandHandler::processCommand(const std::string &commandLine) {
     // USE RESP parser
     auto tokens = parseRespCommands(commandLine);
     if (tokens.empty()) return "-Error : empty command \r\n";
