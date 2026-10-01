@@ -1,2 +1,3 @@
 .vscode/
 my_redis_server
+build/
