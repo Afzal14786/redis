@@ -3,6 +3,7 @@
 #include <iostream>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 /**
  * Global pointer for signal handling
@@ -32,5 +33,30 @@ void RedisServer::shutdown() {
  * running the server 
  */
 void RedisServer::run() {
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket < 0) {  // means there is an error
+        std::cerr << "Error while creating server socket.\n";
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
+    sockaddr_in serverAddr{};
+
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_socket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        std::cerr << "Error while binding server socket.\n";
+        return;
+    }
+
+    if (listen(server_socket, 10) < 0) {
+        std::cerr << "Error while listining on Server socket.\n";
+        return;
+    }
+
+    std::cout <<  "Redis server is listining on Port " << port << "\n";
 }
