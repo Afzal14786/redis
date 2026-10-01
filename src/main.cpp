@@ -2,6 +2,8 @@
 
 #include "./include/RedisServer.h"
 #include <iostream>
+#include <thread>
+#include <chrono>
 
 
 int main(int argc, char* argv[]) {
@@ -34,4 +36,21 @@ int main(int argc, char* argv[]) {
      */
     RedisServer server(port);
 
+    /**
+     * background persistance : 
+     * dump the database every 30 second . (60 * 5 - save database)
+     */
+
+    std::thread persistanceThread([]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(300));  // means every 5 minute
+            // dump the database
+        }
+    });
+
+    persistanceThread.detach();
+
+    server.run();
+
+    return 0;
 }
