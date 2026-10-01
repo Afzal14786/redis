@@ -9,3 +9,9 @@
 9. Singletone Pattern
 10. Bitwise Operators 
 11. std::
+
+---------- We are having following number of classes  ----------------
+
+RedisServer Class           -- for running and shutdown
+RedisDatabase Class         -- doing every operations
+RedisCommandHandler Class   -- Handle All The Commands
