@@ -1,6 +1,6 @@
 
 
-#include "./include/RedisServer.h"
+#include "../include/RedisServer.h"
 #include <iostream>
 #include <thread>
 #include <chrono>
