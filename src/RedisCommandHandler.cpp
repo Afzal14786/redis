@@ -73,6 +73,15 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
         response << "+PONG\r\n";
     } else if(cmd == "ECHO") {
         // resposnse something something ... 
+    } 
+    // key value operations
+
+    // list operations
+
+    // hash operations
+
+    else {
+        response << "-Error Unknown Command.\r\n";
     }
 
     return response.str();
