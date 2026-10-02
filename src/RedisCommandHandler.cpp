@@ -1,5 +1,5 @@
-
 #include "../include/RedisCommandHandler.h"
+#include "../include/RedisDatabase.h"
 #include <vector>
 #include <string>
 #include <sstream>
@@ -66,8 +66,14 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
     std::ostringstream response;
 
     // connect to database
+    RedisDatabase &db = RedisDatabase::getInstance();
 
     // check commands
+    if (cmd == "PING") {
+        response << "+PONG\r\n";
+    } else if(cmd == "ECHO") {
+        // resposnse something something ... 
+    }
 
     return response.str();
 }
