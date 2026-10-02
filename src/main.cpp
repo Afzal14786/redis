@@ -1,6 +1,7 @@
 
 
 #include "../include/RedisServer.h"
+#include "../include/RedisDatabase.h"
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -44,7 +45,12 @@ int main(int argc, char* argv[]) {
     std::thread persistanceThread([]() {
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(300));  // means every 5 minute
-            // dump the database
+            // dump the 
+            if (!RedisDatabase::getInstance().dump("dump.my_rdb")) {
+                std::cerr << "Error : while dumping the database.\n";
+            } else {
+                std::cout << "Database dumped to dump.my_rdb\n";
+            }
         }
     });
 
