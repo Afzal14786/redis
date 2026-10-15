@@ -12,7 +12,7 @@ int main(int argc, char* argv[]) {
      * @param port 6379
      * @details this set the default port 
      */
-    int port = 6379;
+    int port = 6378;
 
     /**
      * @details if user want to run this redis server is some specific port
