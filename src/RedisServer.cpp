@@ -19,7 +19,7 @@ static RedisServer* globalServer = nullptr;
 
 void signalHandler(int signum) {
     if (globalServer) {
-        std::cout << "caught signal " << signum << ", shutting down.\n";
+        std::cout << "\ncaught signal " << signum << ", shutting down.\n";
         globalServer->shutdown();
     }
     exit(signum);
