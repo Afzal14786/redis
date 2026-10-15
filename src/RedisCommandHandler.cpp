@@ -69,13 +69,127 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
     RedisDatabase &db = RedisDatabase::getInstance();
 
     // check commands
+
+    // common commands
+
+    /**
+     * @command PING
+     * @response PONG
+     */
     if (cmd == "PING") {
         response << "+PONG\r\n";
-    } else if(cmd == "ECHO") {
-        // resposnse something something ... 
     } 
+    
+    /**
+     * @command ECHO
+     * 
+     */
+    else if(cmd == "ECHO") {
+        if (tokens.size() < 2) 
+            response << "-Error: ECHO requires a message\r\n";
+        response << "+" << tokens[1] << "\r\n";
+    } 
+    
+    /**
+     * @command
+     * FLUSHALL
+     */
+    else if (cmd == "FLUSHALL") {
+        db.flushAll();
+        response << "+OK" << "\r\n";
+    }
+
     // key value operations
 
+    /**
+     * @command
+     * SET
+     */
+    else if (cmd == "SET") {
+        if (tokens.size() < 3) {
+            response << "-Error: SET requires key and value\r\n";
+        } else {
+            db.set(tokens[0], tokens[1]);
+            response << "+OK" << "\r\n";
+        }
+    } 
+    
+    /**
+     * @command
+     * GET
+     */
+    else if (cmd == "GET") {
+        if (tokens.size() < 2) 
+            response << "-Error: GET requires a key\r\n";
+        else {
+            std::string value;
+            if (db.get(tokens[1], value)) {
+                response << "$" << value.size() << "\r\n" << value << "\r\n";
+            } else {
+                response << "$-1\r\n";
+            }
+        }
+    } 
+    /**
+     * @command
+     * KEYS
+     */
+    else if (cmd == "KEYS") {
+        std::vector<std::string> all_keys = db.keys();
+        response << "*" << all_keys.size() << "\r\n";
+        for (const auto &key : all_keys)
+            response << "$" << key.size() << "\r\n" << key << "\r\n";
+    } 
+    
+    /**
+     * @command
+     * TYPE
+     */
+    else if (cmd == "TYPE") {
+        if (tokens.size() < 2) 
+            response << "-Error: TYPE requires a key\r\n";
+        else 
+            response << "+" << db.type(tokens[1]) << "\r\n";
+    } 
+    
+    /**
+     * @command
+     * DEL | UNLINK
+     */
+    else if (cmd == "DEL" || cmd == "UNLINK") {
+        if (tokens.size() < 2) {
+            response << "-Error: " << cmd << " requires a key\r\n";
+        } else {
+            bool res = db.del(tokens[1]);
+            response << ":" << (res ? 1 : 0) << "\r\n";
+        }
+    } 
+    
+    /**
+     * @command
+     * EXPIRE
+     */
+    else if (cmd == "EXPIRE") {
+        if (tokens.size() < 3) 
+            response << "-Error: EXPIRE requires key and time in seconds\r\n";
+        else {
+            if (db.expire(tokens[1], tokens[2]))  // expires is 300 seconds means within 5 minutes
+                response << "+OK\r\n";
+        }
+    } 
+    
+    /**
+     * @command
+     * RENAME
+     */
+    else if (cmd == "RENAME") {
+        if (tokens.size() < 3) 
+            response << "-Error: RENAME requires old_key and new_key\r\n";
+        else {
+            if (db.rename(tokens[1], tokens[2]))
+                response << "+OK\r\n";
+        }
+    }
     // list operations
 
     // hash operations
