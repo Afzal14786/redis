@@ -87,7 +87,8 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
     else if(cmd == "ECHO") {
         if (tokens.size() < 2) 
             response << "-Error: ECHO requires a message\r\n";
-        response << "+" << tokens[1] << "\r\n";
+        else 
+            response << "+" << tokens[1] << "\r\n";
     } 
     
     /**
@@ -109,7 +110,7 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
         if (tokens.size() < 3) {
             response << "-Error: SET requires key and value\r\n";
         } else {
-            db.set(tokens[0], tokens[1]);
+            db.set(tokens[1], tokens[2]);
             response << "+OK" << "\r\n";
         }
     } 
@@ -191,6 +192,8 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
         else {
             if (db.rename(tokens[1], tokens[2]))
                 response << "+OK\r\n";
+            else
+                response << "-Error: no such key.\r\n";
         }
     }
     // list operations
