@@ -178,27 +178,66 @@ static std::string handle_l_len(const std::vector<std::string> &tokens, RedisDat
     return ":" + std::to_string(len) + "\r\n";
 }
 
-// push into the front
-static std::string handle_l_push(const std::vector<std::string> &tokens, RedisDatabase &db) {
+
+static std::string handle_l_push(const std::vector<std::string>& tokens, RedisDatabase& db) {
+    // Step 1: Validate the arguments.
+    // Syntax: LPUSH key value [value ...]
     if (tokens.size() < 3) {
         return "-ERR wrong number of arguments for LPUSH\r\n";
-    } else {
-        db.list_l_push(tokens[1], tokens[2]);
-        size_t len = db.list_len(tokens[1]);
-        return ":" + std::to_string(len) + "\r\n";
     }
+
+    // Step 2: Insert every supplied value at the beginning.
+    //
+    // Example:
+    // LPUSH fruits apple banana mango
+    //
+    // Insert apple:  [apple]
+    // Insert banana: [banana, apple]
+    // Insert mango:  [mango, banana, apple]
+    //
+    // This matches Redis's LPUSH ordering when multiple values
+    // are supplied in a single command.
+    for (size_t i = 2; i < tokens.size(); ++i) {
+        db.list_l_push(tokens[1], tokens[i]);
+    }
+
+    // Step 3: Return the final list length.
+    size_t len = db.list_len(tokens[1]);
+
+    return ":" + std::to_string(len) + "\r\n";
 }
 
-// push into the back
-static std::string handle_r_push(const std::vector<std::string> &tokens, RedisDatabase &db) {
+
+
+static std::string handle_r_push(const std::vector<std::string>& tokens, RedisDatabase& db) {
+    // Step 1: Validate the arguments.
+    // Syntax: RPUSH key value [value ...]
+    // At least one value is required after the key.
     if (tokens.size() < 3) {
         return "-ERR wrong number of arguments for RPUSH\r\n";
-    } else {
-        db.list_r_push(tokens[1], tokens[2]);
-        size_t len = db.list_len(tokens[1]);
-        return ":" + std::to_string(len) + "\r\n";
     }
+
+    // Step 2: Append every supplied value to the end of the list.
+    //
+    // tokens[0] = "RPUSH"
+    // tokens[1] = key
+    // tokens[2] onwards = values to append
+    //
+    // Example:
+    // RPUSH fruits apple banana mango
+    //
+    // First append apple, then banana, then mango.
+    for (size_t i = 2; i < tokens.size(); ++i) {
+        db.list_r_push(tokens[1], tokens[i]);
+    }
+
+    // Step 3: Return the final length of the list.
+    // Redis responds with an integer representing the list length.
+    size_t len = db.list_len(tokens[1]);
+
+    return ":" + std::to_string(len) + "\r\n";
 }
+
 
 // popped from the front
 static std::string handle_l_pop(const std::vector<std::string> &tokens, RedisDatabase &db) {
@@ -246,7 +285,7 @@ static std::string handle_l_rem(const std::vector<std::string> &tokens, RedisDat
 }
 
 static std::string handle_l_index(const std::vector<std::string> &tokens, RedisDatabase &db) {
-    if (tokens.size() < 4) {
+    if (tokens.size() != 3) {
         return "-ERR wrong number of arguments for LINDEX\r\n";
     } else {
         int index;
@@ -269,58 +308,144 @@ static std::string handle_l_index(const std::vector<std::string> &tokens, RedisD
     }
 }
 
-static std::string handle_l_set(const std::vector<std::string> &tokens, RedisDatabase &db) {
-    if (tokens.size() < 4) {
-        return "-ERR wrong number of arguments of LSET\r\n";
+
+static std::string handle_l_set(const std::vector<std::string>& tokens,RedisDatabase& db    ) {
+    // Step 1: Validate the number of arguments.
+    // Syntax: LSET key index value
+    //
+    // tokens[0] = "LSET"
+    // tokens[1] = key
+    // tokens[2] = index
+    // tokens[3] = new value
+    if (tokens.size() != 4) {
+        return "-ERR wrong number of arguments for LSET\r\n";
     }
+    
+    // Step 2: Convert the index from a string to an integer.
     int index;
+
     try {
         size_t pos;
         index = std::stoi(tokens[2], &pos);
-        if (pos != tokens[2].size())
-            return "-ERR value is not an interger or out of range\r\n";
-    } catch (const std::exception &) {
+
+        // Reject inputs such as "1abc".
+        if (pos != tokens[2].size()) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+    } catch (const std::exception&) {
         return "-ERR value is not an integer or out of range\r\n";
     }
 
-    std::string value;
-    if (db.list_lset(tokens[1], index, value)) {
+    // Step 3: Update the list element.
+    //
+    // IMPORTANT:
+    // tokens[3] contains the new value supplied by the client.
+    // Do not pass an empty or uninitialized local variable here.
+    if (db.list_lset(tokens[1], index, tokens[3])) {
+        // RESP simple-string success response.
         return "+OK\r\n";
     }
-    return "no such key\r\n";
+
+    // Step 4: Return a valid RESP error if the key or index is invalid.
+    return "-ERR index out of range or list does not exist\r\n";
 }
 
-static std::string handle_l_range(const std::vector<std::string> &tokens, RedisDatabase &db) {
-    if (tokens.size() < 4) {
+
+static std::string handle_l_range(const std::vector<std::string>& tokens, RedisDatabase& db) {
+    // Step 1: Validate the number of arguments.
+    // Syntax: LRANGE key start stop
+    //
+    // tokens[0] = "LRANGE"
+    // tokens[1] = key
+    // tokens[2] = start index
+    // tokens[3] = stop index
+    //
+    // Exactly 4 tokens are required.
+    if (tokens.size() != 4) {
         return "-ERR wrong number of arguments for LRANGE\r\n";
     }
 
+    // Step 2: Declare variables to store the start and stop indexes.
     int start;
     int stop;
 
+    // Step 3: Convert the start and stop arguments from strings to integers.
+    //
+    // Command arguments arrive as strings, so we need to convert
+    // tokens[2] and tokens[3] into integers before calling list_range().
+    //
+    // std::stoi() converts a string into an integer.
+    // The position variable tells us how many characters were consumed.
+    // We use it to reject inputs such as "2abc", which std::stoi()
+    // could otherwise partially parse as the integer 2.
     try {
         size_t pos;
+
+        // Convert the start index to an integer.
         start = std::stoi(tokens[2], &pos);
-        if (pos != tokens[2].size())
+
+        // Ensure the entire start argument was a valid integer.
+        if (pos != tokens[2].size()) {
             return "-ERR value is not an integer or out of range\r\n";
-        
+        }
+
+        // Convert the stop index to an integer.
         stop = std::stoi(tokens[3], &pos);
-        if (pos != tokens[3].size())
+
+        // Ensure the entire stop argument was a valid integer.
+        if (pos != tokens[3].size()) {
             return "-ERR value is not an integer or out of range\r\n";
-    } catch (const std::exception &) {
+        }
+    } catch (const std::exception&) {
+        // std::stoi() throws an exception if the argument is invalid
+        // or if its value is outside the range supported by int.
         return "-ERR value is not an integer or out of range\r\n";
     }
 
-    std::vector<std::string> elements = db.list_range(tokens[1], start, stop);
+    // Step 4: Retrieve the requested range from the database.
+    //
+    // list_range() receives the key, start index, and stop index.
+    // The database method is responsible for finding the list and
+    // handling indexes, including negative indexes and invalid ranges.
+    //
+    // Example:
+    // LRANGE fruits 0 2
+    // might return: {"apple", "banana", "mango"}
+    std::vector<std::string> elements =
+        db.list_range(tokens[1], start, stop);
+
+    // Step 5: Create a stream to construct the RESP response.
+    //
+    // RESP arrays begin with:
+    // *<number-of-elements>\r\n
+    //
+    // Each element is encoded as a bulk string:
+    // $<string-length>\r\n
+    // <string-value>\r\n
     std::ostringstream response;
 
+    // Write the RESP array header.
+    // elements.size() is the number of strings in the returned range.
     response << "*" << elements.size() << "\r\n";
-    for (const auto &elem : elements) {
-        response << "$" << elements.size() << "\r\n" << elem << "\r\n";
+
+    // Step 6: Encode every list element as a RESP bulk string.
+    for (const auto& elem : elements) {
+        // IMPORTANT:
+        // elem.size() is the length of THIS element.
+        // Do not use elements.size() here, because that gives
+        // the number of elements in the vector, not the string length.
+        response << "$" << elem.size() << "\r\n";
+
+        // Write the actual string followed by the RESP line terminator.
+        response << elem << "\r\n";
     }
 
+    // Step 7: Return the complete RESP response to the caller.
+    //
+    // The command handler can then send this response to the client.
     return response.str();
 }
+
 
 RedisCommandHandler::RedisCommandHandler(){}
 
