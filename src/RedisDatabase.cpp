@@ -35,6 +35,17 @@ void RedisDatabase::set(const std::string &key, const std::string &value) {
 bool RedisDatabase::get(const std::string &key, std::string &value) {
     std::lock_guard<std::mutex> lock(db_mutex);
     
+    auto expire = expiry_map.find(key);
+
+    if (expire != expiry_map.end() && std::chrono::steady_clock::now() >= expire->second) {
+        kv_store.erase(key);
+        list_store.erase(key);
+        hash_store.erase(key);
+        expiry_map.erase(expire);
+
+        return false;
+    }
+
     auto it = kv_store.find(key);
     if (it != kv_store.end()) {
         value = it->second;
