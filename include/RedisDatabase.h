@@ -22,11 +22,11 @@ public:
      * @details key value operatios on redis
      */
     void set(const std::string &key, const std::string &value);
-    bool get(const std::string &key, const std::string &value);
+    bool get(const std::string &key, std::string &value);
     std::vector<std::string> keys();
     std::string type(const std::string &key);
     bool del(const std::string &key);
-    bool expire(const std::string &key, std::string &seconds);
+    bool expire(const std::string &key, int seconds);
     bool rename(const std::string &old_key, const std::string &new_key);
     
 private:
