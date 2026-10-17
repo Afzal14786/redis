@@ -42,6 +42,12 @@ void RedisServer::shutdown() {
          * this is a method define inside <unistd> header file as a POSIX system call.
          * it takes socker file descriptor (int) as an argument
          */
+        // before shutdown persist the database
+        if (RedisDatabase::getInstance().dump("dump.my_rdb")) {
+            std::cout << "Database dumped to dump.my_rdb\n";
+        } else {
+            std::cerr << "Error while dumping the database.\n";
+        }
         close(server_socket);
     }
 
@@ -109,11 +115,10 @@ void RedisServer::run() {
         if (t.joinable()) t.join();
     }
 
-    // before shutdown persist the database
-    if (RedisDatabase::getInstance().dump("dump.my_rdb")) {
-        std::cout << "Database dumped to dump.my_rdb\n";
-    } else {
-        std::cerr << "Error while dumping the database.\n";
-    }
-    // shutdown
+    // Before shutdown, persist the database
+    if (RedisDatabase::getInstance().dump("dump.my_rdb"))
+        std::cout << "Database Dumped to dump.my_rdb\n";
+    else 
+        std::cerr << "Error dumping database\n";
+
 }
