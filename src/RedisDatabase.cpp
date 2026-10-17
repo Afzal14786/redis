@@ -4,6 +4,8 @@
 #include <sstream>
 #include <mutex>
 #include <fstream>
+#include <algorithm>
+#include <iterator>
 
 RedisDatabase& RedisDatabase::getInstance() {
     static RedisDatabase instance;
@@ -157,6 +159,509 @@ bool RedisDatabase::rename(const std::string &old_key, const std::string &new_ke
 
 
 // list operations
+
+// LIST_LEN
+
+/**
+ * @brief Returns the number of elements stored in a list.
+ *
+ * Searches for the given key in list_store. If the key exists,
+ * returns the number of elements in its vector. Otherwise,
+ * returns 0.
+ *
+ * The mutex protects list_store from concurrent modifications.
+ *
+ * @param key The key identifying the list.
+ * @return Number of elements, or 0 if the key does not exist.
+ *
+ * @complexity
+ * Time:  O(1) average, assuming hash-based lookup.
+ * Space: O(1) auxiliary space.
+ */
+size_t RedisDatabase::list_len(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it != list_store.end()) {
+        return it->second.size();
+    }
+
+    return 0;
+}
+
+
+// LIST_L_PUSH
+
+/**
+ * @brief Inserts an element at the beginning of a list.
+ *
+ * Accesses the list associated with key. If the key does not
+ * exist, list_store[key] creates an empty list first.
+ *
+ * The new element is inserted at index 0. Because the underlying
+ * container is std::vector, existing elements may need to shift
+ * one position to the right.
+ *
+ * @param key   The key identifying the list.
+ * @param value The element to insert.
+ * @return The updated length of the list.
+ *
+ * @complexity
+ * Time:  O(n), where n is the current list length.
+ * Space: O(n) auxiliary storage in the worst case if the vector
+ *        reallocates its internal storage.
+ */
+size_t RedisDatabase::list_l_push(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto& list = list_store[key];
+    list.insert(list.begin(), value);
+
+    return list.size();
+}
+
+
+// LIST_R_PUSH
+
+/**
+ * @brief Inserts an element at the end of a list.
+ *
+ * Uses push_back() to append the new value. If the key does not
+ * exist, an empty list is created automatically.
+ *
+ * The updated list length is returned to the command handler.
+ *
+ * @param key   The key identifying the list.
+ * @param value The element to append.
+ * @return The updated length of the list.
+ *
+ * @complexity
+ * Time:  O(1) amortized; O(n) in the worst case when reallocation
+ *        moves the existing elements.
+ * Space: O(1) auxiliary space amortized; O(n) additional storage
+ *        may be needed during reallocation.
+ */
+size_t RedisDatabase::list_r_push(const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto& list = list_store[key];
+
+    list.push_back(value);
+
+    return list.size();
+}
+
+
+// LIST_L_POP
+
+/**
+ * @brief Removes and returns the first element of a list.
+ *
+ * Finds the list and checks whether it contains any elements.
+ * If it does, copies the first element into value and removes it.
+ *
+ * The key is erased when its list becomes empty, matching the
+ * expected behavior of a REDIS-style list.
+ *
+ * @param key   The key identifying the list.
+ * @param value Output parameter that receives the removed value.
+ * @return true if an element was removed; false if the list
+ *         does not exist or is empty.
+ *
+ * @complexity
+ * Time:  O(n), because vector::erase(begin()) shifts remaining
+ *        elements to the left.
+ * Space: O(1) auxiliary space, excluding the returned string.
+ */
+bool RedisDatabase::list_l_pop(const std::string& key, std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end() || it->second.empty()) {
+        return false;
+    }
+
+    auto& list = it->second;
+
+    value = list.front();
+    list.erase(list.begin());
+
+    if (list.empty()) {
+        list_store.erase(it);
+    }
+
+    return true;
+}
+
+
+// LIST_R_POP
+
+/**
+ * @brief Removes and returns the last element of a list.
+ *
+ * Finds the list and checks whether it contains any elements.
+ * If it does, copies the last element into value and removes it
+ * using pop_back().
+ *
+ * The key is erased when its list becomes empty.
+ *
+ * @param key   The key identifying the list.
+ * @param value Output parameter that receives the removed value.
+ * @return true if an element was removed; false if the list
+ *         does not exist or is empty.
+ *
+ * @complexity
+ * Time:  O(1), excluding the cost of copying the returned string.
+ * Space: O(1) auxiliary space, excluding the output string.
+ */
+bool RedisDatabase::list_r_pop(const std::string& key, std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end() || it->second.empty()) {
+        return false;
+    }
+
+    auto& list = it->second;
+
+    value = list.back();
+    list.pop_back();
+
+    if (list.empty()) {
+        list_store.erase(it);
+    }
+
+    return true;
+}
+
+
+// LIST_LREM
+
+/**
+ * @brief Removes matching elements from a list.
+ *
+ * The count argument determines which matching elements are removed:
+ *
+ * count > 0 : Remove up to count matches, scanning from head to tail.
+ * count < 0 : Remove up to abs(count) matches, scanning from tail
+ *             to head. Earlier matching elements are retained.
+ * count == 0: Remove every matching element.
+ *
+ * This implementation compacts the vector in place rather than
+ * repeatedly erasing elements. Repeated vector erasure can make
+ * the worst-case runtime O(n^2).
+ *
+ * For a negative count, the function first counts occurrences,
+ * determines how many must remain, and then compacts the vector
+ * while retaining the earliest matching occurrences.
+ *
+ * The key is erased if all list elements are removed.
+ *
+ * @param key   The key identifying the list.
+ * @param count Number and direction of removals.
+ * @param value The value to remove.
+ * @return Number of elements removed.
+ *
+ * @complexity
+ * Time:  O(n), where n is the original list length.
+ * Space: O(1) auxiliary space, excluding container internals.
+ */
+int RedisDatabase::list_lrem(const std::string& key, int count, const std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end()) {
+        return 0;
+    }
+
+    auto& list = it->second;
+
+    if (count == 0) {
+        auto new_end = std::remove(list.begin(), list.end(), value);
+
+        int removed = static_cast<int>(
+            std::distance(new_end, list.end())
+        );
+
+        list.erase(new_end, list.end());
+
+        if (list.empty()) {
+            list_store.erase(it);
+        }
+
+        return removed;
+    }
+
+    if (count > 0) {
+        int removed = 0;
+        auto write = list.begin();
+
+        for (auto read = list.begin(); read != list.end(); ++read) {
+            if (*read == value && removed < count) {
+                ++removed;
+                continue;
+            }
+
+            if (write != read) {
+                *write = std::move(*read);
+            }
+
+            ++write;
+        }
+
+        list.erase(write, list.end());
+
+        if (list.empty()) {
+            list_store.erase(it);
+        }
+
+        return removed;
+    }
+
+    // Convert to a wider signed type before negation. This avoids
+    // overflow if count is INT_MIN.
+    const long long requested = -static_cast<long long>(count);
+
+    // Count all matching elements.
+    size_t occurrences = 0;
+
+    for (const auto& element : list) {
+        if (element == value) {
+            ++occurrences;
+        }
+    }
+
+    // Remove the last requested occurrences by retaining only the
+    // earlier matches. If requested exceeds occurrences, retain none.
+    const size_t matches_to_keep =
+        requested >= static_cast<long long>(occurrences)
+            ? 0
+            : occurrences - static_cast<size_t>(requested);
+
+    size_t matches_kept = 0;
+    int removed = 0;
+    auto write = list.begin();
+
+    for (auto read = list.begin(); read != list.end(); ++read) {
+        if (*read == value) {
+            if (matches_kept >= matches_to_keep) {
+                ++removed;
+                continue;
+            }
+
+            ++matches_kept;
+        }
+
+        if (write != read) {
+            *write = std::move(*read);
+        }
+
+        ++write;
+    }
+
+    list.erase(write, list.end());
+
+    if (list.empty()) {
+        list_store.erase(it);
+    }
+
+    return removed;
+}
+
+
+// LIST_LINDEX
+
+/**
+ * @brief Retrieves the element at a specified list index.
+ *
+ * A non-negative index counts from the beginning:
+ *   0 = first element, 1 = second element, and so on.
+ *
+ * A negative index counts backward from the end:
+ *  -1 = last element, -2 = second-to-last element, and so on.
+ *
+ * The function returns false if the key does not exist or the
+ * resolved index is outside the valid range.
+ *
+ * @param key   The key identifying the list.
+ * @param index Requested element index.
+ * @param value Output parameter that receives the element.
+ * @return true if the element exists; otherwise false.
+ *
+ * @complexity
+ * Time:  O(1) for index calculation and vector access, excluding
+ *        the cost of copying the selected string.
+ * Space: O(1) auxiliary space, excluding the output string.
+ */
+bool RedisDatabase::list_lindex(const std::string& key, int index, std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end()) {
+        return false;
+    }
+
+    const auto& list = it->second;
+    const long long length = static_cast<long long>(list.size());
+
+    long long resolved_index = index;
+
+    if (resolved_index < 0) {
+        resolved_index += length;
+    }
+
+    if (resolved_index < 0 || resolved_index >= length) {
+        return false;
+    }
+
+    value = list[static_cast<size_t>(resolved_index)];
+
+    return true;
+}
+
+// LIST_LSET
+
+/**
+ * @brief Replaces the element at a specified list index.
+ *
+ * Supports both positive and negative indexes.
+ *
+ * Unlike a push operation, LSET does not create a missing list
+ * or append an element. The key must exist and the resolved
+ * index must refer to an existing element.
+ *
+ * @param key   The key identifying the list.
+ * @param index Index of the element to replace.
+ * @param value New value to assign.
+ * @return true if the element was replaced; otherwise false.
+ *
+ * @complexity
+ * Time:  O(1) for index calculation and vector access, excluding
+ *        the cost of assigning the string.
+ * Space: O(1) auxiliary space, excluding string assignment needs.
+ */
+bool RedisDatabase::list_lset(const std::string& key, int index, const std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end()) {
+        return false;
+    }
+
+    auto& list = it->second;
+    const long long length = static_cast<long long>(list.size());
+
+    long long resolved_index = index;
+
+    if (resolved_index < 0) {
+        resolved_index += length;
+    }
+
+    if (resolved_index < 0 || resolved_index >= length) {
+        return false;
+    }
+
+    list[static_cast<size_t>(resolved_index)] = value;
+
+    return true;
+}
+
+
+
+// LIST_RANGE
+
+/**
+ * @brief Returns a range of elements from a list.
+ *
+ * Both start and stop are inclusive.
+ *
+ * Negative indexes count backward from the end:
+ *  -1 = last element, -2 = second-to-last element.
+ *
+ * Indexes are normalized as follows:
+ * - A negative index is adjusted by adding the list length.
+ * - A start index below zero after adjustment is clamped to zero.
+ * - A stop index beyond the end is clamped to the last element.
+ * - If the key is missing, the range is invalid, or start is
+ *   beyond the list, an empty vector is returned.
+ *
+ * The selected elements are copied into a result vector. The
+ * database mutex remains locked while the range is copied, so
+ * other database operations cannot modify the list during this
+ * operation.
+ *
+ * @param key   The key identifying the list.
+ * @param start Starting index, inclusive.
+ * @param stop  Ending index, inclusive.
+ * @return A vector containing the requested elements, or an
+ *         empty vector if no elements match.
+ *
+ * @complexity
+ * Time:  O(k), where k is the number of returned elements,
+ *        excluding the cost of copying their string contents.
+ * Space: O(k) for the returned vector and copied strings.
+ */
+std::vector<std::string> RedisDatabase::list_range(const std::string& key, int start, int stop) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    auto it = list_store.find(key);
+
+    if (it == list_store.end()) {
+        return {};
+    }
+
+    const auto& list = it->second;
+
+    if (list.empty()) {
+        return {};
+    }
+
+    const long long length = static_cast<long long>(list.size());
+
+    long long first = start;
+    long long last = stop;
+
+    // Convert negative indexes to positions relative to the end.
+    if (first < 0) {
+        first += length;
+    }
+
+    if (last < 0) {
+        last += length;
+    }
+
+    // Clamp the start index to the beginning of the list.
+    if (first < 0) {
+        first = 0;
+    }
+
+    // Clamp the stop index to the last valid element.
+    if (last >= length) {
+        last = length - 1;
+    }
+
+    // No valid range exists if start is beyond the end or
+    // the normalized start is greater than the normalized stop.
+    if (first >= length || first > last || last < 0) {
+        return {};
+    }
+
+    std::vector<std::string> result;
+
+    result.reserve(static_cast<size_t>(last - first + 1));
+
+    for (long long i = first; i <= last; ++i) {
+        result.push_back(list[static_cast<size_t>(i)]);
+    }
+
+    return result;
+}
 
 // hash operations
 
