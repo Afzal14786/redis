@@ -1,14 +1,13 @@
-K name Arjun
-K city mumbai
-K language Cpp
-K project RedisServer
-K role deactive
-K colors red
-K status active
-K framework NodeJS
 K database Redis
-L fruits apple banana mango orange
-L languages Cpp JavaScript Python
+K framework NodeJS
+K status active
+K colors red
+K role software_developer
+K project RedisServer
+K language Cpp
+K city mumbai
 L frameworks Express NodeJS React
-H user name:Afzal city:Delhi role:SDE
-H project_info name:RedisServer language:Cpp status:active
+L languages Cpp JavaScript Python
+L fruits apple banana mango orange
+H project_info status:active language:Cpp name:RedisServer
+H user role:SDE city:Delhi name:Afzal
