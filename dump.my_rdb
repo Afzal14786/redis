@@ -1,14 +1,18 @@
-K city mumbai
-K language Cpp
-K project RedisServer
-K role software_developer
-K colors red
 K status active
-K framework NodeJS
-K database Redis
-K token abchtsrsv1578sdygejf7815623sdnsgjhebdfaus
-L fruits apple banana mango orange
-L languages Cpp JavaScript Python
+K role software_developer
+K project RedisServer
+K name afzal
+K language Cpp
+K city mumbai
+L update_test one TWO three FOUR
+L numbers one two three four five
+L rpop_test apple banana
+L rpush_test apple banana mango
+L empty_test
 L frameworks Express NodeJS React
-H user name:Afzal city:Delhi role:SDE
-H project_info name:RedisServer language:Cpp status:active
+L remove_test banana apple mango apple orange
+L lpop_test banana mango
+L lpush_test mango banana apple
+L languages Cpp JavaScript Python
+L colors red blue green yellow
+L fruits apple banana mango orange
