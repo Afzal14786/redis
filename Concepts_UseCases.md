@@ -1,197 +1,219 @@
-# Concepts&UseCases
+
+# Concepts & Use Cases
+
+This document explains the main concepts, classes, and commands in this Redis-inspired key-value server. It is a project-development note, separate from the main `README.md`.
+
+> **Project scope:** The current goal is to complete a small working version first. Advanced Redis compatibility, extra options, and edge-case refinements can be added later. A command listed as planned should not be considered implemented yet.
 
 ---
 
-## Concepts
+## 1. Core Concepts
 
-1. TCP/IP  and Socket Programming
-2. Concurrency and Multithreading
-3. Mutex and Sync..
-4. Data Structures -> Hash Tables, Vectors
-5. Parsing and RESP protocol 
-6. File I/O Presitance
-7. Signal Handling
-8. Command Processing and Response Formatting 
-9. Singleton Pattern 
-10. Bitwise Opretors '|=' 
-11. std libraries
+1. **TCP/IP and socket programming**  
+   The server listens on a TCP port, accepts client connections, receives command data, and sends responses back over sockets.
 
-### Classes
+2. **Concurrency and multithreading**  
+   The server may handle multiple client connections. Shared database state must be accessed safely when requests run concurrently.
 
-- RedisServer class 
+3. **Mutexes and synchronization**  
+   A mutex protects shared data structures from simultaneous unsafe access. For example, database methods can lock `db_mutex` while reading or modifying stored data.
 
-- RedisDatabase class
+4. **Data structures**  
+   - **Hash maps:** Store keys and string values, and can also index lists or hashes by key.
+   - **Vectors/lists:** Hold ordered collections of values and command tokens.
+   - **Strings:** Represent command names, keys, values, and protocol data.
 
-- RedisCommandHandler class
+5. **RESP protocol parsing**  
+   Redis clients communicate using RESP. The command handler parses requests and formats responses such as simple strings (`+OK\r\n`), errors (`-ERR ...\r\n`), integers (`:1\r\n`), bulk strings (`$3\r\nfoo\r\n`), and arrays (`*2\r\n...`).
 
----
+6. **File I/O and persistence**  
+   Persistence saves database data to a file and loads it again when the server starts. Loading and saving should be checked carefully so an empty or failed load does not unintentionally overwrite valid saved data.
 
-## Commands & Operations
+7. **Signal handling and shutdown**  
+   Shutdown handling can be used to stop the server cleanly and save state before exiting.
 
----
+8. **Command dispatch and response formatting**  
+   `RedisCommandHandler` identifies the command, routes it to the correct handler, and returns the handler's response to the server.
 
-### Common Commands
+9. **Singleton pattern**  
+   `RedisDatabase::getInstance()` provides access to the shared database instance used by command handlers.
 
-- **PING**  
-  *Use case:* Before embarking on any data operations, an application can send a `PING` to ensure that the Redis server is alive and responsive—like knocking on a door before entering.
+10. **Bitwise/compound assignment (`|=`)**  
+    For boolean values, `erased |= condition` accumulates whether any operation succeeded while still evaluating each condition.
 
-- **ECHO**  
-  *Use case:* A debugging tool or simple utility to test network connectivity by having the server repeat a message. It can also be used in logging systems to trace commands.
-
-- **FLUSHALL**  
-  *Use case:* When resetting a cache or starting fresh, `FLUSHALL` clears all stored keys. This is useful during development or when you need to wipe out stale data completely.
+11. **C++ standard library**  
+    Common facilities include `std::string`, `std::vector`, `std::unordered_map`, `std::mutex`, `std::lock_guard`, `std::chrono`, `std::istringstream`, and `std::ostringstream`.
 
 ---
 
-### Key/Value Operations
+## 2. Main Classes
 
-- **SET**  
-  *Use case:* Caching user session information or configuration settings. For example, store a user token with `SET session:123 "user_data"`.
+### `RedisServer`
 
-- **GET**  
-  *Use case:* Retrieve stored configuration or session data. For instance, fetch the user session with `GET session:123`.
+Responsible for the networking layer: creating/listening on a socket, accepting clients, receiving requests, and sending responses.
 
-- **KEYS**  
-  *Use case:* List all keys or keys matching a pattern (e.g., `KEYS session:*`) to analyze cache usage or to perform maintenance tasks.
+### `RedisCommandHandler`
 
-- **TYPE**  
-  *Use case:* Check what type of value is stored at a key—useful when the data structure can vary, such as determining if a key holds a string, list, or hash.
+Responsible for parsing commands, validating their arguments, routing them to command-specific handlers, and formatting protocol responses.
 
-- **DEL / UNLINK**  
-  *Use case:* Remove keys that are no longer valid. This might be used to evict a stale cache entry after a user logs out or when cleaning up expired data.
+### `RedisDatabase`
 
-- **EXPIRE**  
-  *Use case:* Set a timeout on keys for caching. For example, cache product details for 3600 seconds so that the cache automatically evicts old data.
+Responsible for storing and retrieving data. The current design separates string values, lists, and hashes into different stores and includes expiration metadata for keys.
 
-- **RENAME**  
-  *Use case:* When restructuring keys during a migration or data reorganization, use `RENAME` to change the key’s name without losing its data.
+### Typical request flow
 
----
-
-### List Operations
-
-- **LGET**  
-  *Use case:* Returns all elements of a list at a given key (much like LRANGE key 0 -1 in real Redis).
-
-- **LLEN**  
-  *Use case:* Check the number of items in a message queue. For instance, determine how many tasks are pending in a job queue.
-
-- **LPUSH / RPUSH**  
-  *Use case:* Add items to a list. This is common in task queues or message brokers—`LPUSH` can be used to add a high-priority task at the beginning, while `RPUSH` appends regular tasks at the end.
-
-- **LPOP / RPOP**  
-  *Use case:* Remove items from a list. For example, dequeue a task from the beginning with `LPOP` or remove the last entry with `RPOP` in a double-ended queue.
-
-- **LREM**  
-  *Use case:* Remove specific elements from a list. For instance, eliminate duplicate notifications or remove a cancelled task from a list.
-
-- **LINDEX**  
-  *Use case:* Retrieve an element at a specific index. Useful when you need to inspect a particular item in a task queue without removing it.
-
-- **LSET**  
-  *Use case:* Update an element at a given position. This might be used in a real-time messaging app where you need to modify a message that is stored in a list.
-
----
-
-### Hash Operations
-
-- **HSET**  
-  *Use case:* Store multiple fields for an object. For example, a user profile with `HSET user:1000 name "Alice" age "30" email "alice@example.com"`.
-
-- **HGET**  
-  *Use case:* Retrieve a specific field from a hash. For instance, fetching the email of a user with `HGET user:1000 email`.
-
-- **HEXISTS**  
-  *Use case:* Check if a particular field exists in a hash. For example, verify if a user profile has an "address" field.
-
-- **HDEL**  
-  *Use case:* Remove a field from a hash. Use it to delete outdated information, like removing a phone number when a user updates their profile.
-
-- **HGETALL**  
-  *Use case:* Retrieve all fields and values of a hash. This is useful when you need the full data set of an object, such as fetching an entire user profile.
-
-- **HKEYS / HVALS**  
-  *Use case:* List all fields (HKEYS) or all values (HVALS) in a hash, which is useful for displaying summary information or iterating through all data points in an object.
-
-- **HLEN**  
-  *Use case:* Determine the number of fields in a hash. For example, quickly checking how many attributes are stored in a user profile.
-
-- **HMSET** 
-  *Use case:* Set multiple fields in a hash at once. This can be useful for batch updates or initializing an object with several properties simultaneously.
-
----
-
-## Tests:
-
----
-
-### 1. Start Your Custom Server
-
-```bash
-./your_project_executable 6379
+```text
+Client
+  |
+  | TCP request (RESP command)
+  v
+RedisServer
+  |
+  | request data
+  v
+RedisCommandHandler
+  |
+  | route to command handler
+  v
+RedisDatabase
+  |
+  | result
+  v
+RESP response -> RedisServer -> Client
 ```
 
 ---
 
-### 2. Connect with redis‑cli
+## 3. Commands and Use Cases
 
-```bash
-redis-cli -p 6379
+The examples below show the intended basic command syntax. The current implementation may support only the arguments described here; Redis options and advanced behavior are out of scope for the first version.
+
+### 3.1 Common commands
+
+| Command | Purpose | Example |
+|---|---|---|
+| `PING` | Check whether the server responds. | `PING` |
+| `ECHO` | Return a supplied message; useful for a basic request/response test. | `ECHO hello` |
+| `FLUSHALL` | Clear stored data. Use carefully because it removes all keys. | `FLUSHALL` |
+
+### 3.2 String and key operations
+
+| Command | Purpose | Example |
+|---|---|---|
+| `SET` | Store a string value under a key. | `SET course cpp` |
+| `GET` | Retrieve the string value for a key. | `GET course` |
+| `KEYS` | Return the keys currently stored in the database. Pattern matching may not be supported in the basic implementation. | `KEYS *` |
+| `TYPE` | Report the stored type, such as string, list, hash, or none. | `TYPE course` |
+| `DEL` / `UNLINK` | Delete a key. The current basic implementation handles one key per command. | `DEL course` |
+| `EXPIRE` | Set a key's time-to-live in seconds. Expiration must also be enforced when the key is accessed. | `EXPIRE course 60` |
+| `RENAME` | Rename an existing key. Expiration metadata should move with the key. | `RENAME old_name new_name` |
+
+### 3.3 List operations
+
+Lists store ordered string elements. They can be used for simple queues, task lists, or ordered collections.
+
+| Command | Purpose | Example |
+|---|---|---|
+| `LLEN` | Return the number of elements in a list. | `LLEN fruits` |
+| `LPUSH` | Insert an element at the beginning of a list. | `LPUSH fruits apple` |
+| `RPUSH` | Insert an element at the end of a list. | `RPUSH fruits orange` |
+| `LPOP` | Remove and return the first element. | `LPOP fruits` |
+| `RPOP` | Remove and return the last element. | `RPOP fruits` |
+| `LREM` | Remove matching elements according to a count and direction. | `LREM fruits 1 apple` |
+| `LINDEX` | Retrieve the element at an index. | `LINDEX fruits 0` |
+| `LSET` | Replace the element at an index. | `LSET fruits 0 pear` |
+| `LRANGE` | Retrieve a range of elements; the stop index is inclusive. | `LRANGE fruits 0 -1` |
+
+For `LINDEX`, `LSET`, and `LRANGE`, negative indexes are intended to count backward from the end of the list if implemented. `LRANGE key 0 -1` is the usual form for requesting the entire list.
+
+### 3.4 Hash operations — planned
+
+Hashes store field/value pairs under one key, making them useful for representing simple objects such as user profiles. These commands are documented as future scope and should only be marked implemented after their handlers and database methods are complete.
+
+| Command | Purpose | Example |
+|---|---|---|
+| `HSET` | Set a field in a hash. | `HSET user:1 name Alice` |
+| `HGET` | Retrieve one field. | `HGET user:1 name` |
+| `HEXISTS` | Check whether a field exists. | `HEXISTS user:1 name` |
+| `HDEL` | Delete a field. | `HDEL user:1 name` |
+| `HGETALL` | Retrieve all fields and values. | `HGETALL user:1` |
+| `HKEYS` / `HVALS` | Retrieve all field names or all field values. | `HKEYS user:1` |
+| `HLEN` | Return the number of fields. | `HLEN user:1` |
+| `HMSET` | Set multiple fields in one command, if included in the planned implementation. | `HMSET user:1 name Alice city Delhi` |
+
+---
+
+## 4. Building and Testing
+
+Use the project's build instructions and executable names. For the current local setup, the server listens on port `6378` by default and the custom client is run from its own project directory.
+
+### Basic string/key test
+
+Run the server, then connect with the custom client:
+
+```text
+PING
+ECHO hello
+SET course cpp
+GET course
+TYPE course
+KEYS *
+DEL course
+GET course
 ```
 
----
+Expected behavior at a high level:
 
-### 3. Common Commands
+- `PING` returns `PONG`.
+- `ECHO hello` returns `hello`.
+- `SET course cpp` returns `OK`.
+- `GET course` returns `cpp`.
+- `TYPE course` reports the key's type.
+- `DEL course` returns an integer indicating whether a key was deleted.
+- The final `GET course` returns a null result because the key was deleted.
 
-| Command        | Example                             | Expected Reply  |
-| -------------- | ----------------------------------- | --------------- |
-| **PING**       | `PING`                              | `PONG`          |
-| **ECHO**       | `ECHO "Hello World"`                | `Hello World`   |
-| **FLUSHALL**   | `FLUSHALL`                          | `OK`            |
+### Basic list test
 
----
+```text
+RPUSH fruits apple
+RPUSH fruits banana
+LPUSH fruits orange
+LLEN fruits
+LRANGE fruits 0 -1
+LINDEX fruits 0
+LSET fruits 0 pear
+LPOP fruits
+RPOP fruits
+```
 
-### 4. Key/Value Operations
+Check that push commands report the resulting list length, `LLEN` reports the current length, and list-reading commands return correctly formatted results.
 
-| Command               | Example                                  | Expected Reply                    |
-| --------------------- | ---------------------------------------- | --------------------------------- |
-| **SET** / **GET**     | `SET mykey "myvalue"`<br>`GET mykey`     | `OK`<br>`"myvalue"`               |
-| **KEYS**              | `KEYS *`                                 | List of keys                      |
-| **TYPE**              | `TYPE mykey`                             | `string`                          |
-| **DEL** / **UNLINK**  | `DEL mykey`                              | `(integer) 1`                     |
-| **EXPIRE**            | `SET session:1 "data"`<br>`EXPIRE session:1 5` | `OK`                          |
-| **RENAME**            | `SET a "x"`<br>`RENAME a b`<br>`GET b`   | `OK`<br>`"x"`                     |
+### Expiration test
 
-> **TIP:** After `EXPIRE`, do any operation (e.g. `GET`) after the TTL to see that the key is gone.
+```text
+SET session:1 data
+EXPIRE session:1 5
+GET session:1
+```
 
----
+Wait longer than five seconds and then run `GET session:1` again. The key should no longer be returned once expiration is enforced by the database.
 
-### 5. List Operations
+### Persistence test
 
-| Command            | Example                                                           | Expected Reply                    |
-| ------------------ | ----------------------------------------------------------------- | --------------------------------- |
-| **LGET**           | `RPUSH L a b c`<br>`LGET L`                                       | `1) "a"`<br>`2) "b"`<br>`3) "c"`   |
-| **LLEN**           | `LLEN L`                                                          | `(integer) 3`                     |
-| **LPUSH / RPUSH**  | `LPUSH L "start"`<br>`RPUSH L "end"`                              | `(integer) 4`<br>`(integer) 5`    |
-| **LPOP / RPOP**    | `LPOP L`<br>`RPOP L`                                              | `"start"`<br>`"end"`              |
-| **LREM**           | `RPUSH L x y x z x`<br>`LREM L 2 x`<br>`LREM L 0 x`               | `(integer) 2`<br>`(integer) <n>`  |
-| **LINDEX**         | `LINDEX L 1`<br>`LINDEX L -1`                                     | `"y"`<br>`"z"`                    |
-| **LSET**           | `LSET L 1 "new_val"`<br>`LINDEX L 1`                              | `OK`<br>`"new_val"`               |
+1. Store a few values.
+2. Shut down the server using its supported shutdown method.
+3. Restart it.
+4. Check whether the values were restored.
 
----
-
-### 6. Hash Operations
-
-| Command           | Example                                                                                                 | Expected Reply                                                 |
-| ----------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| **HSET**          | `HSET user:1 name Alice age 30 email a@x.com`                                                           | `(integer) 1` (per field)                                      |
-| **HGET**          | `HGET user:1 email`                                                                                     | `"a@x.com"`                                                    |
-| **HEXISTS**       | `HEXISTS user:1 address`<br>`HEXISTS user:1 name`                                                        | `(integer) 0`<br>`(integer) 1`                                 |
-| **HDEL**          | `HDEL user:1 age`<br>`HEXISTS user:1 age`                                                               | `(integer) 1`<br>`(integer) 0`                                 |
-| **HLEN**          | `HLEN user:1`                                                                                            | `(integer) 2`                                                  |
-| **HKEYS**         | `HKEYS user:1`                                                                                           | `1) "name"`<br>`2) "email"`                                    |
-| **HVALS**         | `HVALS user:1`                                                                                           | `1) "Alice"`<br>`2) "a@x.com"`                                 |
-| **HGETALL**       | `HGETALL user:1`                                                                                         | `1) "name"`<br>`2) "Alice"`<br>`3) "email"`<br>`4) "a@x.com"`  |
-| **HMSET**         | `HMSET user:2 name Bob age 25 city Paris`<br>`HGETALL user:2`                                           | `OK`<br>`1) "name"`<br>`2) "Bob"`<br>`3) "age"`<br>`4) "25"`<br>`5) "city"`<br>`6) "Paris"` |
+Persistence should be tested separately from command handling because a successful command response does not by itself prove that the data was saved correctly.
 
 ---
+
+## 5. Current Development Priorities
+
+1. Finish the basic string/key and list database methods.
+2. Ensure every command handler returns its response to `processCommand()` and the server sends that response to the client.
+3. Test valid commands, missing arguments, missing keys, and empty lists.
+4. Verify expiration and persistence behavior.
+5. Implement hash operations after the current scope is stable.
+6. Improve Redis compatibility and edge cases after the minimum working version is complete.
