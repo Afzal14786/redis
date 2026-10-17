@@ -82,7 +82,7 @@ bool RedisDatabase::del(const std::string &key) {
     erased |= kv_store.erase(key) > 0;
     erased |= list_store.erase(key) > 0;
     erased |= hash_store.erase(key) > 0;
-    return false;
+    return erased;
 }
 
 bool RedisDatabase::expire(const std::string &key, int seconds) {
@@ -137,7 +137,7 @@ bool RedisDatabase::rename(const std::string &old_key, const std::string &new_ke
 
     auto it_expire = expiry_map.find(old_key);
     if (it_expire != expiry_map.end()) {
-        expiry_map[old_key] = it_expire->second;
+        expiry_map[new_key] = it_expire->second;
         expiry_map.erase(it_expire);
     }
     
@@ -230,6 +230,8 @@ bool RedisDatabase::load(const std::string &filename) {
     while (std::getline(ifs, line)) {
         std::istringstream iss(line);
         char type;
+        if (!(iss >> type))
+            continue;
         if (type == 'K') {
             std::string key, value;
             iss >> key >> value;
