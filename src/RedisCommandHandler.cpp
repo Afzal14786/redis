@@ -4,14 +4,59 @@
 #include <string>
 #include <exception>
 #include <sstream>
+#include <cctype>
 #include <algorithm>
 
-std::vector<std::string> parseRespCommands(const std::string &input) {
+
+/**
+ * @brief Parses a raw command string into individual command tokens.
+ *
+ * This function supports two input formats:
+ *
+ * 1. RESP array format:
+ *      *<number-of-elements>\r\n
+ *      $<element-length>\r\n<element-data>\r\n
+ *
+ *    Each array element is represented as a RESP bulk string.
+ *
+ * 2. Whitespace-separated format:
+ *      SET name Afzal
+ *
+ *    If the input does not begin with '*', it is split using
+ *    whitespace as the delimiter.
+ *
+ * Parsing process for RESP input:
+ *    1. Read the array header and its element count.
+ *    2. Read each bulk-string length.
+ *    3. Extract exactly the declared number of bytes.
+ *    4. Validate the CRLF terminator after each element.
+ *    5. Return the extracted tokens.
+ *
+ * Error handling:
+ *    Malformed RESP input returns an empty vector. Numeric parsing
+ *    errors are caught so malformed input does not propagate a
+ *    std::stoi exception to the caller.
+ *
+ * @param input The raw command string received from the client.
+ *
+ * @return A vector containing the parsed command and its arguments.
+ *         An empty vector indicates empty input, an empty array,
+ *         or malformed RESP input.
+ *
+ * @note This parser handles one RESP array per input string; it does
+ *       not implement pipelined commands or every RESP data type.
+ */
+
+std::vector<std::string> parseRespCommands(const std::string& input) {
     std::vector<std::string> tokens;
 
-    if (input.empty()) return tokens;
-    
-    // if it doesn't start with '*' then fallback to splitting by whitespaces
+    // Nothing can be parsed from an empty input string.
+    if (input.empty()) {
+        return tokens;
+    }
+
+    // Preserve support for simple, whitespace-separated commands.
+    // RESP arrays begin with '*'; all other input uses this fallback.
     if (input[0] != '*') {
         std::istringstream iss(input);
         std::string token;
@@ -23,31 +68,105 @@ std::vector<std::string> parseRespCommands(const std::string &input) {
         return tokens;
     }
 
-    size_t pos = 0;
-    if (input[pos] != '*') return tokens;
-    pos++;  // means skip the '*'
+    // Start immediately after the RESP array marker '*'.
+    size_t pos = 1;
 
-
-    // crlf = Carriage Return (\r), Line Feed (\n)
+    // Locate the end of the array header.
     size_t crlf = input.find("\r\n", pos);
-    if (crlf == std::string::npos) return tokens;
-    int numElement = std::stoi(input.substr(pos, crlf - pos));
+    if (crlf == std::string::npos) {
+        return {};
+    }
+
+    int numElements;
+
+    try {
+        // Parse the number of elements declared by the array.
+        size_t parsedChars = 0;
+        numElements = std::stoi(
+            input.substr(pos, crlf - pos),
+            &parsedChars
+        );
+
+        // Reject invalid suffixes, such as "*2abc".
+        if (parsedChars != crlf - pos || numElements < 0) {
+            return {};
+        }
+    } catch (const std::exception&) {
+        // Reject invalid or out-of-range array counts.
+        return {};
+    }
+
+    // Move past the array header and its CRLF.
     pos = crlf + 2;
 
-    for (int i = 0; i < numElement; ++i) {
-        if (pos >= input.size() || input[pos] != '$') break;
-        pos++; // means skipping the '$'
-        
+    // Parse each declared array element as a bulk string.
+    for (int i = 0; i < numElements; ++i) {
+        // Every element in this parser's supported RESP format
+        // must begin with '$'.
+        if (pos >= input.size() || input[pos] != '$') {
+            return {};
+        }
+
+        // Skip the bulk-string marker.
+        ++pos;
+
+        // Find the end of the bulk-string length header.
         crlf = input.find("\r\n", pos);
-        if (crlf == std::string::npos) break;
-        int len = std::stoi(input.substr(pos, crlf - pos));
+        if (crlf == std::string::npos) {
+            return {};
+        }
+
+        int length;
+
+        try {
+            // Parse the declared byte length of the element.
+            size_t parsedChars = 0;
+            length = std::stoi(
+                input.substr(pos, crlf - pos),
+                &parsedChars
+            );
+
+            // Reject malformed lengths and negative lengths.
+            if (parsedChars != crlf - pos || length < 0) {
+                return {};
+            }
+        } catch (const std::exception&) {
+            // Reject invalid or out-of-range bulk-string lengths.
+            return {};
+        }
+
+        // Move to the beginning of the element's actual data.
         pos = crlf + 2;
 
-        if (pos + len > input.size()) break;
-        std::string token = input.substr(pos, len);
-        tokens.push_back(token);
+        // Ensure the payload and its two-byte CRLF terminator fit
+        // inside the input. Subtraction avoids unsafe addition
+        // when checking the declared length against input.size().
+        if (pos > input.size() ||
+            input.size() - pos < 2 ||
+            static_cast<size_t>(length) > input.size() - pos - 2) {
+            return {};
+        }
 
-        pos += len + 2;  // skip token and CRLF
+        // Extract exactly 'length' bytes. Unlike whitespace
+        // splitting, this preserves spaces inside a RESP value.
+        tokens.push_back(input.substr(pos, length));
+
+        // Advance past the payload.
+        pos += static_cast<size_t>(length);
+
+        // Each RESP bulk-string payload must end with CRLF.
+        if (input[pos] != '\r' || input[pos + 1] != '\n') {
+            return {};
+        }
+
+        // Skip the payload terminator before reading the next item.
+        pos += 2;
+    }
+
+    // Reject trailing data rather than silently accepting a malformed
+    // or unsupported multi-command input.
+    if (pos != input.size()) {
+        return {};
     }
 
     return tokens;
@@ -58,19 +177,98 @@ std::vector<std::string> parseRespCommands(const std::string &input) {
  * 
  */
 
+/**
+ * @brief Handles the PING command.
+ *
+ * PING is used to check whether the server is responding to commands.
+ *
+ * In this implementation, PING does not require any arguments and
+ * always returns a PONG response.
+ *
+ * The database reference is unused because this command does not
+ * read or modify stored data.
+ *
+ * RESP response:
+ *     +PONG\r\n
+ *
+ * @param tokens Parsed command tokens. Unused by this handler.
+ * @param database Reference to the database instance. Unused.
+ *
+ * @return A RESP simple-string response containing PONG.
+ */
+
 static std::string handle_ping(const std::vector<std::string>& /* tokens */, RedisDatabase& /* database */) {
+    // RESP simple strings begin with '+' and end with CRLF.
     return "+PONG\r\n";
 }
 
-static std::string handle_echo(const std::vector<std::string>& tokens, RedisDatabase& /**database */) {
-    if (tokens.size() < 2) 
+/**
+ * @brief Handles the ECHO command.
+ *
+ * Syntax:
+ *     ECHO message
+ *
+ * Returns the supplied message without modifying the database.
+ *
+ * Argument validation:
+ *     Exactly two tokens are required:
+ *       tokens[0] = command name
+ *       tokens[1] = message
+ *
+ * RESP response:
+ *     $<message-length>\r\n<message>\r\n
+ *
+ * A bulk string is used so the response includes the message's
+ * byte length, allowing the client to identify the end of the value.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param database Reference to the database instance. Unused.
+ *
+ * @return The message encoded as a RESP bulk string, or a RESP error
+ *         if the number of arguments is incorrect.
+ */
+
+
+static std::string handle_echo(const std::vector<std::string>& tokens, RedisDatabase& /* database */) {
+    // Require the command name and exactly one message argument.
+    if (tokens.size() != 2) {
         return "-ERR wrong number of arguments for ECHO\r\n";
-    
-    return "$" + std::to_string(tokens[1].size()) + "\r\n" + tokens[1] + "\r\n";
+    }
+
+    // Use a reference to avoid copying the message string.
+    const std::string& message = tokens[1];
+
+    // Serialize the message as a RESP bulk string.
+    return "$" + std::to_string(message.size()) + "\r\n" + message + "\r\n";
 }
 
-static std::string handle_flushall(const std::vector<std::string>& /** tokens */, RedisDatabase& db) {
+/**
+ * @brief Handles the FLUSHALL command.
+ *
+ * Removes all stored data managed by RedisDatabase.
+ *
+ * This handler delegates the actual clearing operation to
+ * RedisDatabase::flushAll(), keeping storage management inside
+ * the database layer rather than manipulating its internal
+ * containers directly.
+ *
+ * RESP response:
+ *     +OK\r\n
+ *
+ * @param tokens Parsed command tokens. Unused by this handler.
+ * @param db Reference to the database instance to be cleared.
+ *
+ * @return A RESP simple-string success response.
+ *
+ * @warning This command clears the database's stored data.
+ */
+
+
+static std::string handle_flushall(const std::vector<std::string>& /* tokens */, RedisDatabase& db) {
+    // Delegate the clearing operation to the database layer.
     db.flushAll();
+
+    // Return a RESP simple-string acknowledgement.
     return "+OK\r\n";
 }
 
@@ -81,83 +279,310 @@ static std::string handle_flushall(const std::vector<std::string>& /** tokens */
  * key value command handler
  */
 
+
+/**
+ * @brief Handles the SET command.
+ *
+ * Syntax:
+ *     SET key value
+ *
+ * Stores the supplied value under the specified key by delegating
+ * the storage operation to RedisDatabase::set().
+ *
+ * Argument layout:
+ *     tokens[0] = command name
+ *     tokens[1] = key
+ *     tokens[2] = value
+ *
+ * RESP response:
+ *     +OK\r\n on success.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to store the value.
+ *
+ * @return A RESP simple-string success response, or a RESP error
+ *         if the key or value argument is missing.
+ *
+ * @note This implementation checks for at least three tokens.
+ *       Additional arguments are currently ignored.
+ */
+
 static std::string handle_set(const std::vector<std::string> &tokens, RedisDatabase &db) {
+    // A valid SET command needs a command name, key, and value.
     if (tokens.size() < 3) 
         return "-ERR wrong number of arguments for set\r\n";
     else {
+
+        // Delegate storage and any associated database rules to the
+        // database layer rather than modifying its containers here.
         db.set(tokens[1], tokens[2]);
+
+        // RESP simple-string response indicating success.
         return "+OK\r\n";
     }
 }
 
+/**
+ * @brief Handles the GET command.
+ *
+ * Syntax:
+ *     GET key
+ *
+ * Retrieves the string value associated with the specified key.
+ * The lookup is delegated to RedisDatabase::get().
+ *
+ * Argument layout:
+ *     tokens[0] = command name
+ *     tokens[1] = key
+ *
+ * RESP response:
+ *     $<length>\r\n<value>\r\n when the key exists.
+ *     $-1\r\n when the key is missing or no string value is found.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to retrieve the value.
+ *
+ * @return The stored value as a RESP bulk string, a null bulk string
+ *         if the lookup fails, or a RESP error for missing arguments.
+ *
+ * @note Additional arguments are currently ignored.
+ */
+
 static std::string handle_get(const std::vector<std::string> &tokens, RedisDatabase &db) {
+    // A key is required after the command name.
     if (tokens.size() < 2)
         return "-ERR wrong number of arguments for get\r\n";
     else {
         std::string val;
+
+        // get() writes the retrieved value into 'val' and reports
+        // whether the lookup succeeded.
         if (db.get(tokens[1], val)) {
+
+            // Encode the value as a RESP bulk string.
             return "$" + std::to_string(val.size()) + "\r\n" + val + "\r\n";
         } else {
+
+            // RESP2 null bulk string represents a missing value.
             return "$-1\r\n";
         }
     }
 }
 
+/**
+ * @brief Handles the KEYS command.
+ *
+ * Retrieves all keys returned by RedisDatabase::keys() and serializes
+ * them into a RESP array of bulk strings.
+ *
+ * Response structure:
+ *     *<number-of-keys>\r\n
+ *     $<key-length>\r\n<key>\r\n
+ *     ...
+ *
+ * @param tokens Parsed command tokens. Currently unused.
+ * @param db Reference to the database used to retrieve the keys.
+ *
+ * @return A RESP array containing the retrieved keys.
+ *
+ * @note This implementation does not process a key pattern such as
+ *       KEYS *. It also does not validate the number of arguments.
+ */
+
+
 static std::string handle_keys(const std::vector<std::string> &tokens, RedisDatabase &db) {
+
+    // Retrieve the keys through the database interface.
     std::vector<std::string> all_keys = db.keys();
+
+    // Use a stream to assemble the complete RESP response.
     std::ostringstream response;
+
+    // A RESP array header declares the number of elements that follow.
     response << "*" << all_keys.size() << "\r\n";
+    
+    // Encode each key as a separate RESP bulk string.
     for (const auto &key : all_keys) {
         response << "$" << key.size() << "\r\n" << key << "\r\n";
     }
     return response.str();
 }
 
+/**
+ * @brief Handles the TYPE command.
+ *
+ * Syntax:
+ *     TYPE key
+ *
+ * Asks RedisDatabase::type() to identify the type associated with
+ * the supplied key.
+ *
+ * Argument layout:
+ *     tokens[0] = command name
+ *     tokens[1] = key
+ *
+ * RESP response:
+ *     +<type>\r\n
+ *
+ * The exact type names and the response for a missing key are
+ * determined by RedisDatabase::type().
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to inspect the key.
+ *
+ * @return The database's type result encoded as a RESP simple string,
+ *         or a RESP error when the key argument is missing.
+ *
+ * @note Additional arguments are currently ignored.
+ */
+
 static std::string handle_type(const std::vector<std::string> &tokens, RedisDatabase &db) {
+
+    // The command must include the key to inspect.
     if (tokens.size() < 2)
         return "-ERR wrong number of arguments for TYPE\r\n";
     
     else 
+        // Prefix the type result with '+' to form a RESP simple string.
         return "+" + db.type(tokens[1]) + "\r\n";
 }
 
+/**
+ * @brief Handles the DEL and UNLINK commands.
+ *
+ * Syntax supported by this implementation:
+ *     DEL key
+ *     UNLINK key
+ *
+ * Delegates deletion to RedisDatabase::del().
+ *
+ * Argument layout:
+ *     tokens[0] = command name
+ *     tokens[1] = key
+ *
+ * RESP response:
+ *     :1\r\n if the database reports that the key was deleted.
+ *     :0\r\n if the database reports that the key was not deleted.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to delete the key.
+ * @param cmd Normalized command name, used in the error response.
+ *
+ * @return A RESP integer reply, or a RESP error if the key is missing.
+ *
+ * @note Only the first key is passed to db.del(). Multiple-key
+ *       deletion is not implemented by this handler.
+ * @note DEL and UNLINK share the same deletion behavior here;
+ *       Redis's asynchronous UNLINK semantics are not implemented.
+ */
+
 static std::string handle_del(const std::vector<std::string> &tokens, RedisDatabase &db, std::string &cmd) {
+
+    // A key must follow the command name.
     if (tokens.size() < 2) {
         return "-ERR wrong number of arguments for " + cmd + "\r\n";
     } else {
-        bool res = db.del(tokens[1]);
-        return ":" + std::to_string((res ? 1 : 0)) + "\r\n";
+
+        // Delegate deletion to the database and capture its result.
+        bool deleted = db.del(tokens[1]);
+
+        // Convert the boolean result to the RESP integer 1 or 0.
+        return ":" + std::to_string((deleted ? 1 : 0)) + "\r\n";
     }
 }
 
-static std::string handle_expire(const std::vector<std::string> &tokens, RedisDatabase &db) {
-    if (tokens.size() < 2) {
-        return "-ERR wrong number of arguments for EXPIRE\r\n";
-    } else {
-        try {
-            size_t pos = 0;
-            int seconds = std::stoi(tokens[2], &pos);
-            if (pos != tokens[2].size() || seconds < 0) {
-                return "-ERR invalid expire time\r\n";
-            } else if (db.expire(tokens[1], seconds)) {
-                return ":1\r\n";
-            } else {
-                return ":0\r\n";
-            }
 
-        } catch (const std::exception &) {
+/**
+ * @brief Handles the EXPIRE command.
+ *
+ * Syntax:
+ *     EXPIRE key seconds
+ *
+ * Assigns an expiration time to an existing key through RedisDatabase.
+ *
+ * @return RESP integer 1 if the expiration was applied, or 0 if the
+ *         key does not exist. Invalid arguments produce a RESP error.
+ */
+static std::string handle_expire(
+    const std::vector<std::string>& tokens,
+    RedisDatabase& db
+) {
+    // EXPIRE requires exactly three tokens:
+    // command name, key, and expiration duration.
+    // Validate before accessing tokens[1] or tokens[2].
+    if (tokens.size() != 3) {
+        return "-ERR wrong number of arguments for EXPIRE\r\n";
+    }
+
+    int seconds;
+
+    try {
+        size_t pos = 0;
+
+        // Convert the duration and track how many characters were parsed.
+        seconds = std::stoi(tokens[2], &pos);
+
+        // Reject partially valid inputs such as "10abc".
+        if (pos != tokens[2].size()) {
             return "-ERR invalid expire time\r\n";
         }
+    } catch (const std::exception&) {
+        // Handles invalid numbers and values outside the int range.
+        return "-ERR invalid expire time\r\n";
     }
+
+    // Redis-style EXPIRE accepts zero and negative durations.
+    // Your database implementation treats these as immediate expiration.
+    if (db.expire(tokens[1], seconds)) {
+        return ":1\r\n";
+    }
+
+    return ":0\r\n";
 }
 
+
+/**
+ * @brief Handles the RENAME command.
+ *
+ * Syntax:
+ *     RENAME old_key new_key
+ *
+ * Requests RedisDatabase::rename() to rename an existing key.
+ *
+ * Argument layout:
+ *     tokens[0] = command name
+ *     tokens[1] = existing key name
+ *     tokens[2] = destination key name
+ *
+ * RESP response:
+ *     +OK\r\n when the database reports success.
+ *     -ERR no such key found\r\n when it reports failure.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to rename the key.
+ *
+ * @return A RESP simple-string success response or a RESP error.
+ *
+ * @note This implementation checks for at least three tokens.
+ *       Additional arguments are currently ignored.
+ * @note The exact rename behavior, including handling of an existing
+ *       destination key, is determined by RedisDatabase::rename().
+ */
+
+
 static std::string handle_rename(const std::vector<std::string> &token, RedisDatabase &db) {
+
+    // Both the source and destination keys are required.
     if (token.size() < 3) {
         return "-ERR wrong number of arguments for RENAME\r\n";
     } else {
+
+        // Delegate the rename operation to the database layer.
         if (db.rename(token[1], token[2])) {
             return "+OK\r\n";
         } else {
+
+            // The database reports that the rename could not be completed.
             return "-ERR no such key found\r\n";
         }
     }
@@ -170,14 +595,153 @@ static std::string handle_rename(const std::vector<std::string> &token, RedisDat
  * @details list operation handlers
  */
 
+
+/**
+ * @brief Handles the LGET command and returns all elements of a list.
+ *
+ * Command syntax:
+ *     LGET <key>
+ *
+ * Example:
+ *     LGET fruits
+ *
+ * If the list contains:
+ *     ["apple", "banana", "mango"]
+ *
+ * The handler retrieves the complete list using db.list_get() and
+ * serializes the elements into a RESP array containing bulk strings.
+ *
+ * RESP response example:
+ *     *3\r\n
+ *     $5\r\napple\r\n
+ *     $6\r\nbanana\r\n
+ *     $5\r\nmango\r\n
+ *
+ * Response structure:
+ *     *3       -> The array contains three elements.
+ *     $5        -> The next element contains five bytes.
+ *     apple     -> The actual element value.
+ *
+ * Error handling:
+ *     If the command does not contain exactly two tokens
+ *     (the command name and its key), an error response is returned.
+ *
+ * Missing key:
+ *     If the key does not exist, list_get() returns an empty vector.
+ *     The handler then returns an empty RESP array: *0\r\n.
+ *
+ * Thread safety:
+ *     This handler does not directly access list_store. It delegates
+ *     database access to list_get(), which protects the shared data
+ *     with db_mutex.
+ *
+ * @param tokens The parsed command and its arguments.
+ *                tokens[0] is "LGET".
+ *                tokens[1] is the key identifying the list.
+ *
+ * @param db Reference to the RedisDatabase instance used to retrieve
+ *           the list elements.
+ *
+ * @return A RESP-formatted array containing all list elements, or a
+ *         RESP error if the number of arguments is incorrect.
+ */
+static std::string handle_l_get(const std::vector<std::string>& tokens, RedisDatabase& db) {
+    // LGET requires exactly two tokens:
+    // 1. The command name.
+    // 2. The key whose list elements should be retrieved.
+    //
+    // Reject missing keys and unexpected additional arguments.
+    if (tokens.size() != 2) {
+        return "-ERR wrong number of arguments for LGET\r\n";
+    }
+
+    // Retrieve all elements associated with the specified key.
+    //
+    // list_get() returns a copy of the list, so this operation
+    // does not modify the original list stored in the database.
+    auto elem = db.list_get(tokens[1]);
+
+    // Build the RESP response in a string stream.
+    //
+    // A RESP array starts with:
+    //     *<number-of-elements>\r\n
+    //
+    // For example, a list containing three elements starts with *3\r\n.
+    std::ostringstream oss;
+    oss << "*" << elem.size() << "\r\n";
+
+    // Serialize every list element as a RESP bulk string.
+    //
+    // A bulk string has this format:
+    //     $<number-of-bytes>\r\n
+    //     <element-data>\r\n
+    //
+    // e.size() provides the string's byte length.
+    // Using the actual length allows values containing spaces
+    // to be represented correctly in the RESP response.
+    for (const auto& e : elem) {
+        oss << "$" << e.size() << "\r\n"
+            << e << "\r\n";
+    }
+
+    // Convert the completed response stream into a string
+    // that the server can send to the client.
+    return oss.str();
+}
+
+
+/**
+ * @brief Returns the number of elements in a Redis list.
+ *
+ * Implements the LLEN command by retrieving the length of the
+ * list associated with the specified key.
+ *
+ * If the key does not exist or the database reports an empty
+ * list, the result depends on the behavior of RedisDatabase::list_len().
+ *
+ * @param tokens Parsed command tokens:
+ *               tokens[0] = "LLEN"
+ *               tokens[1] = key
+ * @param db Reference to the RedisDatabase instance.
+ *
+ * @return A RESP integer containing the list length, or a RESP
+ *         error if the key argument is missing.
+ *
+ * @note Additional arguments are currently ignored.
+ */
+
 static std::string handle_l_len(const std::vector<std::string> &tokens, RedisDatabase &db) {
     if (tokens.size() < 2) {
         return "-ERR wrong number of argument for LLEN\r\n";
     }
+
+    // Retrieve the current length of the list.
     size_t len = db.list_len(tokens[1]);
+
+    // Encode the length as a RESP integer.
     return ":" + std::to_string(len) + "\r\n";
 }
 
+/**
+ * @brief Handles the LPUSH command.
+ *
+ * Syntax:
+ *     LPUSH key value [value ...]
+ *
+ * Inserts each supplied value at the beginning of the list.
+ * When multiple values are supplied, they are processed from
+ * left to right, so the final list order is reversed relative
+ * to the supplied values.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used for list operations.
+ *
+ * @return A RESP integer containing the final list length,
+ *         or a RESP error if the key or values are missing.
+ *
+ * @note The final length is obtained through list_len() after
+ *       all insertions have completed.
+ */
 
 static std::string handle_l_push(const std::vector<std::string>& tokens, RedisDatabase& db) {
     // Step 1: Validate the arguments.
@@ -208,6 +772,24 @@ static std::string handle_l_push(const std::vector<std::string>& tokens, RedisDa
 }
 
 
+/**
+ * @brief Handles the RPUSH command.
+ *
+ * Syntax:
+ *     RPUSH key value [value ...]
+ *
+ * Appends each supplied value to the end of the list in the
+ * order in which the values appear in the command.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used for list operations.
+ *
+ * @return A RESP integer containing the final list length,
+ *         or a RESP error if the key or values are missing.
+ *
+ * @note The final length is obtained through list_len() after
+ *       all insertions have completed.
+ */
 
 static std::string handle_r_push(const std::vector<std::string>& tokens, RedisDatabase& db) {
     // Step 1: Validate the arguments.
@@ -239,30 +821,106 @@ static std::string handle_r_push(const std::vector<std::string>& tokens, RedisDa
 }
 
 
-// popped from the front
+
+/**
+ * @brief Removes and returns the first element of a list.
+ *
+ * Implements the LPOP command by asking RedisDatabase to remove
+ * the element at the front of the list associated with the key.
+ *
+ * If the list contains an element, that element is returned as
+ * a RESP bulk string. If no element can be popped, the handler
+ * returns a RESP null bulk string.
+ *
+ * @param tokens Parsed command tokens:
+ *               tokens[0] = "LPOP"
+ *               tokens[1] = key
+ * @param db Reference to the RedisDatabase instance.
+ *
+ * @return A RESP bulk string containing the removed element,
+ *         or "$-1\r\n" if no element is available.
+ *
+ * @note Only the key argument is used. Optional arguments, such
+ *       as a count, are not currently implemented by this handler.
+ */
+
 static std::string handle_l_pop(const std::vector<std::string> &tokens, RedisDatabase &db) {
     if (tokens.size() < 2) {
         return "-ERR wrong number of arguments for LPOP\r\n";
     }
 
     std::string val;
+    // Remove the first element and store it in val.
     if (db.list_l_pop(tokens[1], val)) 
+        // Return the removed element as a RESP bulk string.
         return "$" + std::to_string(val.size()) + "\r\n" + val + "\r\n";
     else 
+        // Return a null bulk string when no element is available.
         return "$-1\r\n";
 }
 
-// popped from the back
+
+/**
+ * @brief Removes and returns the last element of a list.
+ *
+ * Implements the RPOP command by asking RedisDatabase to remove
+ * the element at the back of the list associated with the key.
+ *
+ * If an element is available, it is returned as a RESP bulk
+ * string. Otherwise, the handler returns a RESP null bulk string.
+ *
+ * @param tokens Parsed command tokens:
+ *               tokens[0] = "RPOP"
+ *               tokens[1] = key
+ * @param db Reference to the RedisDatabase instance.
+ *
+ * @return A RESP bulk string containing the removed element,
+ *         or "$-1\r\n" if no element is available.
+ *
+ * @note Only the key argument is used. Optional arguments, such
+ *       as a count, are not currently implemented by this handler.
+ */
+
 static std::string handle_r_pop(const std::vector<std::string> &tokens, RedisDatabase &db) {
     if (tokens.size() < 2) 
         return "-ERR wrong number of arguments for RPOP\r\n";
     
     std::string val;
+
+    // Remove the last element and store it in val.
     if (db.list_r_pop(tokens[1], val))
+        // Return the removed element as a RESP bulk string.
         return "$" + std::to_string(val.size()) + "\r\n" + val + "\r\n";
     else 
+        // Return a null bulk string when no element is available.
         return "$-1\r\n";
 }
+
+
+/**
+ * @brief Removes matching elements from a list.
+ *
+ * Implements the LREM command using the supplied key, count,
+ * and target value.
+ *
+ * The count determines how the database searches for matching
+ * elements, according to the behavior implemented by
+ * RedisDatabase::list_lrem().
+ *
+ * @param tokens Parsed command tokens:
+ *               tokens[0] = "LREM"
+ *               tokens[1] = key
+ *               tokens[2] = count
+ *               tokens[3] = value
+ * @param db Reference to the RedisDatabase instance.
+ *
+ * @return A RESP integer containing the number of removed
+ *         elements, or a RESP error if the arguments or count
+ *         are invalid.
+ *
+ * @note Only tokens[3] is used as the target value; additional
+ *       arguments are ignored.
+ */
 
 static std::string handle_l_rem(const std::vector<std::string> &tokens, RedisDatabase &db) {
     if (tokens.size() < 4) {
@@ -270,9 +928,13 @@ static std::string handle_l_rem(const std::vector<std::string> &tokens, RedisDat
     }
 
     int count;
+
+    // Convert the count argument to an integer.
     try {
         size_t pos;
         count = std::stoi(tokens[2], &pos);
+
+        // Reject values that contain non-numeric trailing characters.
         if (pos != tokens[2].size()) {
             return "-ERR value is not an integer or out of range\r\n";
         }
@@ -280,18 +942,49 @@ static std::string handle_l_rem(const std::vector<std::string> &tokens, RedisDat
         return "-ERR value is not an integer or out of range\r\n";
     }
 
+    // Remove matching elements and retrieve the removal count.
     int removed = db.list_lrem(tokens[1], count, tokens[3]);
+
+    // Return the number of removed elements as a RESP integer.
     return ":" + std::to_string(removed) + "\r\n";
 }
+
+/**
+ * @brief Retrieves an element from a list by index.
+ *
+ * Implements the LINDEX command by passing the key and requested
+ * index to RedisDatabase::list_lindex().
+ *
+ * If the index identifies an existing element, the handler
+ * returns that element as a RESP bulk string. If the key or
+ * index does not identify an available element, it returns a
+ * RESP null bulk string.
+ *
+ * @param tokens Parsed command tokens:
+ *               tokens[0] = "LINDEX"
+ *               tokens[1] = key
+ *               tokens[2] = index
+ * @param db Reference to the RedisDatabase instance.
+ *
+ * @return A RESP bulk string containing the requested element,
+ *         "$-1\r\n" if no element is available, or a RESP error
+ *         if the arguments or index are invalid.
+ *
+ * @note This handler requires exactly three tokens.
+ */
 
 static std::string handle_l_index(const std::vector<std::string> &tokens, RedisDatabase &db) {
     if (tokens.size() != 3) {
         return "-ERR wrong number of arguments for LINDEX\r\n";
     } else {
         int index;
+
+        // Convert the index argument to an integer.
         try {
             size_t pos;
             index = std::stoi(tokens[2], &pos);
+
+            // Reject values that contain non-numeric trailing characters.
             if (pos != tokens[2].size())
                 return "-ERR value is not an integer or out of range\r\n";
             
@@ -300,14 +993,36 @@ static std::string handle_l_index(const std::vector<std::string> &tokens, RedisD
         }
 
         std::string value;
+
+        // Retrieve the element at the requested index.
         if (db.list_lindex(tokens[1], index, value)) {
+            // Encode the retrieved value as a RESP bulk string.
             return "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
         }
 
+        // Return a null bulk string when the index is unavailable.
         return "$-1\r\n";
     }
 }
 
+/**
+ * @brief Handles the LSET command.
+ *
+ * Syntax:
+ *     LSET key index value
+ *
+ * Replaces the element at the specified list index with the
+ * supplied value. The database layer determines whether the
+ * key and index identify a valid list element.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used for the update.
+ *
+ * @return A RESP simple string containing OK on success, or
+ *         a RESP error if the arguments, key, or index are invalid.
+ *
+ * @note Exactly four tokens are required.
+ */
 
 static std::string handle_l_set(const std::vector<std::string>& tokens,RedisDatabase& db    ) {
     // Step 1: Validate the number of arguments.
@@ -350,6 +1065,27 @@ static std::string handle_l_set(const std::vector<std::string>& tokens,RedisData
     return "-ERR index out of range or list does not exist\r\n";
 }
 
+/**
+ * @brief Handles the LRANGE command.
+ *
+ * Syntax:
+ *     LRANGE key start stop
+ *
+ * Retrieves the requested range of list elements by delegating
+ * index interpretation and range selection to RedisDatabase.
+ * The returned elements are serialized as a RESP array of
+ * bulk strings.
+ *
+ * @param tokens Parsed command and its arguments.
+ * @param db Reference to the database used to retrieve the range.
+ *
+ * @return A RESP array containing the selected elements, or a
+ *         RESP error if the argument count or indexes are invalid.
+ *
+ * @note Exactly four tokens are required.
+ * @note Negative indexes and range boundaries depend on the
+ *       implementation of RedisDatabase::list_range().
+ */
 
 static std::string handle_l_range(const std::vector<std::string>& tokens, RedisDatabase& db) {
     // Step 1: Validate the number of arguments.
@@ -869,8 +1605,56 @@ std::string handle_hash_mset(std::vector<std::string>& tokens, RedisDatabase& db
 }
 
 
+/**
+ * @brief Constructs a RedisCommandHandler instance.
+ *
+ * Initializes a command handler responsible for processing
+ * incoming Redis-style commands.
+ *
+ * The constructor currently performs no explicit initialization.
+ * Command parsing, command dispatching, and database operations
+ * are performed by other methods.
+ */
 
 RedisCommandHandler::RedisCommandHandler(){}
+
+/**
+ * @brief Processes an incoming command and generates a RESP response.
+ *
+ * This method is the main entry point for command processing.
+ * It parses the incoming command, validates that the parsed
+ * command is not empty, normalizes the command name, obtains
+ * the RedisDatabase singleton, and dispatches the request to
+ * the appropriate command handler.
+ *
+ * The processing flow is:
+ *
+ * 1. Parse the input into command tokens.
+ * 2. Return an error if the command is empty.
+ * 3. Convert the command name to uppercase for case-insensitive
+ *    command matching.
+ * 4. Obtain the RedisDatabase singleton instance.
+ * 5. Dispatch the command to its corresponding handler.
+ * 6. Return the handler's RESP-formatted response.
+ *
+ * Supported commands include basic key-value operations, list
+ * operations, and hash operations. DEL and UNLINK are routed
+ * through the same handler in the current implementation.
+ *
+ * If the command name does not match a supported command,
+ * the method returns an unknown-command error.
+ *
+ * @param commandLine The incoming command represented as a string.
+ *
+ * @return A RESP-formatted response representing the command's
+ *         result or an error.
+ *
+ * @note The commands and argument combinations supported by this
+ *       method depend on the implemented handlers.
+ *
+ * @see parseRespCommands()
+ * @see RedisDatabase::getInstance()
+ */
 
 std::string RedisCommandHandler::processCommand(const std::string &commandLine) {
     // USE RESP parser
@@ -878,7 +1662,20 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
     if (tokens.empty()) return "-Error : empty command \r\n";
 
     std::string cmd = tokens[0];
-    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::toupper);
+    // Normalize the command name to uppercase so command matching
+    // is case-insensitive (for example, "get" becomes "GET").
+    //
+    // Convert through unsigned char before calling std::toupper.
+    // This avoids undefined behavior for negative signed-char values.
+
+    std::transform(
+        cmd.begin(),
+        cmd.end(),
+        cmd.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::toupper(ch));
+        }
+    );
 
     // connect to database
     RedisDatabase &db = RedisDatabase::getInstance();
@@ -1031,6 +1828,15 @@ std::string RedisCommandHandler::processCommand(const std::string &commandLine) 
      */
     else if (cmd == "LSET") {
         return handle_l_set(tokens, db);
+    }
+
+    /**
+     * @command
+     * LGET
+     */
+
+    else if (cmd == "LGET") {
+        return handle_l_get(tokens, db);
     }
 
     /**
