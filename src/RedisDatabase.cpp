@@ -665,6 +665,346 @@ std::vector<std::string> RedisDatabase::list_range(const std::string& key, int s
 
 // hash operations
 
+/*
+ * HSET — Set the value of a field inside a hash.
+ *
+ * Parameters:
+ *   key   : Name of the hash.
+ *   field : Field whose value should be created or updated.
+ *   value : Value to store for the field.
+ *
+ * Returns:
+ *   true  -> The field did not previously exist and was created.
+ *   false -> The field already existed and its value was updated.
+ *
+ * Thread safety:
+ *   db_mutex protects hash_store from concurrent access.
+ */
+bool RedisDatabase::hash_set(const std::string& key, const std::string& field, const std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Access the hash associated with this key.
+    // If the key does not exist, this creates an empty hash.
+    auto& hash = hash_store[key];
+
+    // Check whether the field already exists.
+    auto it = hash.find(field);
+
+    if (it != hash.end()) {
+        // The field exists, so update its value.
+        it->second = value;
+
+        // No new field was created.
+        return false;
+    }
+
+    // The field is new, so insert it with the given value.
+    hash.emplace(field, value);
+
+    // A new field was created.
+    return true;
+}
+
+
+/*
+ * HGET — Retrieve the value associated with a hash field.
+ *
+ * Parameters:
+ *   key   : Name of the hash.
+ *   field : Field whose value should be retrieved.
+ *   value : Output parameter. Receives the stored value if found.
+ *
+ * Returns:
+ *   true  -> The hash and field exist; value contains the result.
+ *   false -> The hash or field does not exist.
+ *
+ * Note:
+ *   The caller must check the return value before using value.
+ */
+bool RedisDatabase::hash_get(const std::string& key, const std::string& field, std::string& value) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Search for the hash without creating a new entry.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        // The requested hash does not exist.
+        return false;
+    }
+
+    // Search for the requested field inside the hash.
+    auto field_it = it->second.find(field);
+
+    if (field_it == it->second.end()) {
+        // The hash exists, but the field does not.
+        return false;
+    }
+
+    // Copy the stored field value into the output parameter.
+    value = field_it->second;
+
+    return true;
+}
+
+
+/*
+ * HEXISTS — Check whether a field exists in a hash.
+ *
+ * Parameters:
+ *   key   : Name of the hash.
+ *   field : Field to check.
+ *
+ * Returns:
+ *   true  -> The field exists.
+ *   false -> The hash or field does not exist.
+ *
+ * This method only checks existence; it does not modify the data.
+ */
+bool RedisDatabase::hash_exists(const std::string& key, const std::string& field) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Find the hash first.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return false;
+    }
+
+    // Return whether the requested field exists in this hash.
+    return it->second.find(field) != it->second.end();
+}
+
+
+/*
+ * HDEL — Delete one field from a hash.
+ *
+ * Parameters:
+ *   key   : Name of the hash.
+ *   field : Field to delete.
+ *
+ * Returns:
+ *   true  -> A field was deleted.
+ *   false -> The hash or field did not exist.
+ *
+ * Redis-style behavior:
+ *   When the last field is removed, the hash key itself should
+ *   no longer exist. This implementation removes the empty hash.
+ *
+ * Note:
+ *   This method deletes one field. The command handler can call
+ *   it repeatedly to support HDEL key field1 field2 field3.
+ */
+bool RedisDatabase::hash_del(const std::string& key, const std::string& field) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Look up the hash.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return false;
+    }
+
+    // erase(field) returns the number of fields removed:
+    // 1 if the field existed, or 0 if it did not.
+    size_t deleted_count = it->second.erase(field);
+
+    if (deleted_count == 0) {
+        return false;
+    }
+
+    // A hash with no remaining fields should be removed.
+    if (it->second.empty()) {
+        hash_store.erase(it);
+    }
+
+    return true;
+}
+
+
+/*
+ * HGETALL — Retrieve every field and value in a hash.
+ *
+ * Parameters:
+ *   key : Name of the hash.
+ *
+ * Returns:
+ *   A copy of the hash's field-value pairs.
+ *   An empty map if the hash does not exist.
+ *
+ * Returning a copy means callers can iterate over the result
+ * without holding db_mutex after this method returns.
+ *
+ * Note:
+ *   Because hash_store uses an unordered_map, iteration order
+ *   is unspecified.
+ */
+std::unordered_map<std::string, std::string> RedisDatabase::hash_getall(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Find the hash without creating one.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return {};
+    }
+
+    // Return a copy of all fields and their values.
+    return it->second;
+}
+
+
+/*
+ * HKEYS — Retrieve all field names from a hash.
+ *
+ * Parameters:
+ *   key : Name of the hash.
+ *
+ * Returns:
+ *   A vector containing all field names.
+ *   An empty vector if the hash does not exist.
+ *
+ * Note:
+ *   Field order is unspecified because the underlying container
+ *   is an unordered_map.
+ */
+std::vector<std::string> RedisDatabase::hash_keys(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    std::vector<std::string> fields;
+
+    // Find the hash.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return fields;
+    }
+
+    // Collect each field name.
+    fields.reserve(it->second.size());
+
+    for (const auto& pair : it->second) {
+        fields.push_back(pair.first);
+    }
+
+    return fields;
+}
+
+
+/*
+ * HVALS — Retrieve all values stored in a hash.
+ *
+ * Parameters:
+ *   key : Name of the hash.
+ *
+ * Returns:
+ *   A vector containing all field values.
+ *   An empty vector if the hash does not exist.
+ *
+ * Important:
+ *   Values are returned in the same iteration order as their
+ *   fields in this unordered_map, but that order is unspecified.
+ */
+std::vector<std::string> RedisDatabase::hash_vals(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    std::vector<std::string> values;
+
+    // Find the hash.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return values;
+    }
+
+    // Collect each field's value.
+    values.reserve(it->second.size());
+
+    for (const auto& pair : it->second) {
+        values.push_back(pair.second);
+    }
+
+    return values;
+}
+
+
+/*
+ * HLEN — Count the fields in a hash.
+ *
+ * Parameters:
+ *   key : Name of the hash.
+ *
+ * Returns:
+ *   The number of fields in the hash.
+ *   Zero if the hash does not exist.
+ */
+size_t RedisDatabase::hash_len(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Find the hash.
+    auto it = hash_store.find(key);
+
+    if (it == hash_store.end()) {
+        return 0;
+    }
+
+    // The size of the inner map is the number of hash fields.
+    return it->second.size();
+}
+
+/*
+ * HMSET — Set multiple fields and values in a hash.
+ *
+ * Parameters:
+ *   key           : Name of the hash.
+ *   fields_values : Vector of field-value pairs to store.
+ *
+ * Returns:
+ *   The number of fields that were newly created.
+ *
+ * Behavior:
+ *   - New fields are inserted.
+ *   - Existing fields have their values overwritten.
+ *   - Existing fields do not increase the returned count.
+ *
+ * Thread safety:
+ *   The entire batch is protected by one mutex lock, so another
+ *   thread cannot modify hash_store halfway through this batch.
+ *
+ * Note:
+ *   We update the map directly instead of calling hash_set().
+ *   hash_set() acquires db_mutex itself, and locking the same
+ *   non-recursive mutex again in this method could deadlock.
+ */
+size_t RedisDatabase::hash_mset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields_values) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Access the hash, creating it if necessary.
+    auto& hash = hash_store[key];
+
+    size_t created_count = 0;
+
+    // Process each field-value pair.
+    for (const auto& pair : fields_values) {
+        const std::string& field = pair.first;
+        const std::string& value = pair.second;
+
+        // Look for the field before deciding whether to insert
+        // a new field or update an existing one.
+        auto it = hash.find(field);
+
+        if (it == hash.end()) {
+            // This field is new.
+            hash.emplace(field, value);
+            ++created_count;
+        } else {
+            // This field already exists; overwrite its value.
+            it->second = value;
+        }
+    }
+
+    return created_count;
+}
+
 /**
  * Memory -> File --- dump()
  * File -> Memory --- load()
