@@ -1,18 +1,22 @@
-K status active
-K role software_developer
-K project RedisServer
-K name afzal
-K language Cpp
 K city mumbai
-L update_test one TWO three FOUR
-L numbers one two three four five
-L rpop_test apple banana
-L rpush_test apple banana mango
-L empty_test
-L frameworks Express NodeJS React
-L remove_test banana apple mango apple orange
-L lpop_test banana mango
-L lpush_test mango banana apple
-L languages Cpp JavaScript Python
-L colors red blue green yellow
+K language Cpp
+K name afzal
+K project RedisServer
+K role software_developer
+K status active
 L fruits apple banana mango orange
+L colors brown red blue green yellow red
+L languages Cpp JavaScript Python
+L lpush_test mango banana apple
+L lpop_test banana mango
+L remove_test banana apple mango apple orange
+L frameworks Express NodeJS React
+L empty_test
+L rpush_test apple banana mango
+L rpop_test apple banana
+L numbers one two three four five
+L update_test one TWO three FOUR
+H user:test phone:9955118287
+H test:employee department:engineering name:meenal city:delhi age:20
+H user:afzal email:iamafzal.tech@gmail.com age:20 address:kopar_khairane_sector12E phone:+919955118287 name:afzal
+H test:user country:INDIA
