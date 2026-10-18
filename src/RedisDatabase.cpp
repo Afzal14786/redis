@@ -7,21 +7,140 @@
 #include <algorithm>
 #include <iterator>
 
+/**
+ * @brief Returns the shared RedisDatabase instance.
+ *
+ * A function-local static object is created the first time this
+ * function is called. Subsequent calls return a reference to the
+ * same object.
+ *
+ * Since C++11, initialization of a function-local static variable
+ * is thread-safe.
+ *
+ * @return Reference to the single RedisDatabase instance.
+ */
 RedisDatabase& RedisDatabase::getInstance() {
     static RedisDatabase instance;
     return instance;
 }
 
-/**
- * implementation of common commmands
- * 
+
+/*
+ * Removes a key from all supported data stores and its expiration map.
+ *
+ * We remove the key from all three stores rather than checking its type
+ * first. This guarantees that no stale copy remains if the same key
+ * accidentally exists in more than one store.
+ *
+ * Expiration metadata is also removed because it must never outlive the
+ * key it belongs to. Otherwise, a future key with the same name could
+ * accidentally inherit an old expiration deadline.
+ *
+ * The caller must hold db_mutex before calling this function.
  */
+void RedisDatabase::removeKeyFromAllStoresLocked(const std::string& key) {
+    kv_store.erase(key);
+    list_store.erase(key);
+    hash_store.erase(key);
+
+    // Remove the TTL so deleted keys cannot leave stale expiration data.
+    expiry_map.erase(key);
+}
+
+/*
+ * Removes a single key if its expiration deadline has been reached.
+ *
+ * steady_clock is used because it measures elapsed time independently
+ * of system-clock changes, such as manually changing the computer's
+ * date or synchronizing the clock.
+ *
+ * A key is expired when:
+ *
+ *     current_time >= expiration_deadline
+ *
+ * If no expiration entry exists, the key has no TTL and this function
+ * leaves it unchanged.
+ *
+ * The caller must hold db_mutex before calling this function.
+ */
+void RedisDatabase::purgeExpiredKeyLocked(const std::string& key) {
+    // Find the key's expiration metadata without creating a new entry.
+    const auto expiry_it = expiry_map.find(key);
+
+    // No expiration entry means there is no TTL to check.
+    if (expiry_it == expiry_map.end()) {
+        return;
+    }
+
+    // Capture the current time and compare it with the stored deadline.
+    const auto now = std::chrono::steady_clock::now();
+
+    // A deadline equal to the current time is already expired.
+    if (now >= expiry_it->second) {
+        // Remove both the stored value and its expiration metadata.
+        removeKeyFromAllStoresLocked(key);
+    }
+}
+
+/*
+ * Removes all keys whose expiration deadlines have passed.
+ *
+ * Instead of checking only the string store, this function iterates
+ * through expiry_map. That is important because expiring keys can
+ * contain strings, lists, or hashes.
+ *
+ * We erase expired entries using the iterator returned by erase().
+ * This allows the loop to continue safely without incrementing an
+ * iterator that has already been invalidated.
+ *
+ * The caller must hold db_mutex before calling this function.
+ */
+void RedisDatabase::purgeAllExpiredLocked() {
+    // Capture the current time once so this cleanup pass uses one
+    // consistent reference time for all expiration comparisons.
+    const auto now = std::chrono::steady_clock::now();
+
+    auto it = expiry_map.begin();
+
+    while (it != expiry_map.end()) {
+        // Keep keys whose expiration deadlines are still in the future.
+        if (now < it->second) {
+            ++it;
+            continue;
+        }
+
+        // This key has expired. Remove it from every data store.
+        kv_store.erase(it->first);
+        list_store.erase(it->first);
+        hash_store.erase(it->first);
+
+        // Erase returns the next valid iterator, so the loop can
+        // safely continue without skipping entries or using an
+        // invalidated iterator.
+        it = expiry_map.erase(it);
+    }
+}
+
+/**
+ * @brief Removes all stored strings, lists, and hashes.
+ *
+ * Acquires db_mutex to prevent other operations using the same mutex
+ * from accessing the database containers during the clearing process.
+ *
+ * @return true after the three data stores have been cleared.
+ *
+ */
+
 
 bool RedisDatabase::flushAll() {
     std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Remove all stored values and their expiration metadata.
     kv_store.clear();
     list_store.clear();
     hash_store.clear();
+    expiry_map.clear();
+
     return true;
 }
 
@@ -29,86 +148,225 @@ bool RedisDatabase::flushAll() {
  * implementation of key value functions
  */
 
-void RedisDatabase::set(const std::string &key, const std::string &value) {
+/**
+ * @brief Stores a string value under the specified key.
+ *
+ * If the key already exists in kv_store, its string value is replaced.
+ * Otherwise, a new string entry is created.
+ *
+ * Setting a value clears its previous expiration deadline. This follows
+ * Redis-style SET behavior: a newly assigned value does not inherit the
+ * old TTL.
+ *
+ * @param key Key under which the value is stored.
+ * @param value String value to store.
+ *
+ * @note This method only updates kv_store and expiry_map. It does not
+ *       remove a same-named entry from list_store or hash_store.
+ */
+
+void RedisDatabase::set(const std::string& key, const std::string& value) {
+    // Protect the database containers from concurrent access.
     std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Insert the string key or replace its existing value.
     kv_store[key] = value;
+
+    // A new SET operation removes the previous expiration deadline.
+    // erase() is safe even when the key has no TTL.
+    expiry_map.erase(key);
 }
 
-bool RedisDatabase::get(const std::string &key, std::string &value) {
+/**
+ * @brief Retrieves a non-expired string value.
+ *
+ * First removes the key if its expiration deadline has passed.
+ * Then searches kv_store for the requested string value.
+ *
+ * @param key Key whose value is requested.
+ * @param value Output parameter populated when the string is found.
+ * @return true if the non-expired string exists; otherwise false.
+ */
+
+bool RedisDatabase::get(const std::string& key, std::string& value) {
     std::lock_guard<std::mutex> lock(db_mutex);
-    
-    auto expire = expiry_map.find(key);
 
-    if (expire != expiry_map.end() && std::chrono::steady_clock::now() >= expire->second) {
-        kv_store.erase(key);
-        list_store.erase(key);
-        hash_store.erase(key);
-        expiry_map.erase(expire);
+    // Remove the key from every store if its TTL has expired.
+    // This helper assumes db_mutex is already locked.
+    purgeExpiredKeyLocked(key);
 
-        return false;
-    }
-
+    // Only return values that still exist after expiration cleanup.
     auto it = kv_store.find(key);
+
     if (it != kv_store.end()) {
         value = it->second;
         return true;
     }
+
     return false;
 }
 
+/**
+ * @brief Returns keys currently present in the database stores.
+ *
+ * Removes expired keys before collecting names from all three stores.
+ *
+ * @return A vector containing the keys found in the stores.
+ *
+ * @note If the same name exists in multiple stores, it can still appear
+ *       more than once. This change only fixes expiration handling.
+ */
+
 std::vector<std::string> RedisDatabase::keys() {
     std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Purge expired strings, lists, and hashes before listing keys.
+    purgeAllExpiredLocked();
+
     std::vector<std::string> result;
-    for (const auto &pairs : kv_store) {
+
+    for (const auto& pairs : kv_store) {
         result.push_back(pairs.first);
     }
 
-    for (const auto &pairs : list_store) {
+    for (const auto& pairs : list_store) {
         result.push_back(pairs.first);
     }
 
-    for (const auto &pairs : hash_store) {
+    for (const auto& pairs : hash_store) {
         result.push_back(pairs.first);
     }
 
     return result;
 }
 
-std::string RedisDatabase::type(const std::string &key) {
+/**
+ * @brief Returns the type of a non-expired key.
+ *
+ * @param key Key whose type is requested.
+ * @return "string", "list", "hash", or "none".
+ */
+
+std::string RedisDatabase::type(const std::string& key) {
     std::lock_guard<std::mutex> lock(db_mutex);
 
-    if (kv_store.find(key) != kv_store.end())
+    // An expired key must behave as if it does not exist.
+    purgeExpiredKeyLocked(key);
+
+    if (kv_store.find(key) != kv_store.end()) {
         return "string";
+    }
 
-    if (list_store.find(key) != list_store.end())
+    if (list_store.find(key) != list_store.end()) {
         return "list";
+    }
 
-    if (hash_store.find(key) != hash_store.end())
+    if (hash_store.find(key) != hash_store.end()) {
         return "hash";
-    else return "none";
+    }
+
+    return "none";
 }
 
-bool RedisDatabase::del(const std::string &key) {
-    std::lock_guard<std::mutex> lock(db_mutex);
-    bool erased = false;
 
-    erased |= kv_store.erase(key) > 0;
-    erased |= list_store.erase(key) > 0;
-    erased |= hash_store.erase(key) > 0;
-    return erased;
+/**
+ * @brief Deletes a key and its expiration metadata.
+ *
+ * Removes the key from all supported stores, including any accidental
+ * same-named entries in multiple stores.
+ *
+ * @param key Key to delete.
+ * @return true if the key existed in at least one data store;
+ *         false otherwise.
+ */
+
+bool RedisDatabase::del(const std::string& key) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Determine whether actual data exists before removing anything.
+    // A stale TTL entry alone does not mean that a key exists.
+    const bool existed =
+        kv_store.find(key) != kv_store.end() ||
+        list_store.find(key) != list_store.end() ||
+        hash_store.find(key) != hash_store.end();
+
+    // Remove data and TTL metadata together.
+    removeKeyFromAllStoresLocked(key);
+
+    return existed;
 }
 
-bool RedisDatabase::expire(const std::string &key, int seconds) {
-    std::lock_guard<std::mutex> lock(db_mutex);
-    bool is_exists = (kv_store.find(key) != kv_store.end()) || (list_store.find(key) != list_store.end()) || (hash_store.find(key) != hash_store.end());
-    if (!is_exists) return false;
 
-    expiry_map[key] = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+/**
+ * @brief Sets an expiration deadline for an existing key.
+ *
+ * @param key Key whose expiration should be set.
+ * @param seconds Number of seconds until expiration.
+ * @return true if the key existed when this operation was processed;
+ *         false if the key was missing or already expired.
+ *
+ * @note A zero or negative duration deletes an existing key immediately.
+ */
+
+bool RedisDatabase::expire(const std::string& key, int seconds) {
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Remove the key first if an earlier TTL has already expired.
+    purgeExpiredKeyLocked(key);
+
+    // Check existence after cleanup, across all supported data types.
+    const bool exists =
+        kv_store.find(key) != kv_store.end() ||
+        list_store.find(key) != list_store.end() ||
+        hash_store.find(key) != hash_store.end();
+
+    if (!exists) {
+        return false;
+    }
+
+    // A zero or negative duration means immediate expiration.
+    if (seconds <= 0) {
+        removeKeyFromAllStoresLocked(key);
+        return true;
+    }
+
+    // Record a new deadline measured using the monotonic clock.
+    expiry_map[key] =
+        std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+
     return true;
 }
 
+/**
+ * @brief Renames a key across the data stores.
+ *
+ * Moves any matching entry from kv_store, list_store, and hash_store
+ * from old_key to new_key. If expiration metadata exists for old_key,
+ * it is transferred to new_key as well.
+ *
+ * @param old_key Existing key name.
+ * @param new_key Destination key name.
+ * @return true if an entry was found in at least one data store;
+ *         false otherwise.
+ *
+ * @note The current implementation can move entries from multiple
+ *       stores if old_key exists in more than one. It also overwrites
+ *       a destination entry in the corresponding store.
+ */
+
 bool RedisDatabase::rename(const std::string &old_key, const std::string &new_key) {
     std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Renaming a key to its own name must not erase it.
+    // Check this before moving entries or modifying the maps.
+    if (old_key == new_key) {
+        return (
+            kv_store.find(old_key) != kv_store.end() ||
+            list_store.find(old_key) != list_store.end() ||
+            hash_store.find(old_key) != hash_store.end()
+        );
+    }
+
     bool found = false;
 
     /**
@@ -158,9 +416,66 @@ bool RedisDatabase::rename(const std::string &old_key, const std::string &new_ke
 }
 
 
-// list operations
+
+/*
+ * List operations
+ *
+ * Each operation locks db_mutex before accessing list_store.
+ * These methods do not invoke the expiration-cleanup helpers, so an expired
+ * list key can remain accessible until another operation purges that key.
+ */
+
 
 // LIST_LEN
+
+
+/**
+ * @brief Retrieves all elements of the list associated with a key.
+ *
+ * This function looks up the supplied key in list_store. If the key
+ * exists, it returns a copy of the vector containing the list elements.
+ * Otherwise, it returns an empty vector.
+ *
+ * The function acquires db_mutex before accessing list_store. This
+ * protects the shared list data from unsynchronized concurrent access
+ * by other database operations that use the same mutex.
+ *
+ * The lock_guard automatically releases the mutex when the function
+ * returns, including when a return statement exits the function.
+ *
+ * @param key The key identifying the list to retrieve.
+ *
+ * @return A copy of the list elements in their stored order, or an
+ *         empty vector if the key does not exist or the list is empty.
+ */
+std::vector<std::string> RedisDatabase::list_get(const std::string& key) {
+    // Acquire the database mutex before accessing shared data.
+    //
+    // std::lock_guard automatically unlocks db_mutex when this
+    // function exits, so we do not need to call unlock() manually.
+    std::lock_guard<std::mutex> lock(db_mutex);
+
+    // Search list_store for the requested key.
+    //
+    // find() returns an iterator to the matching entry if the key
+    // exists; otherwise, it returns list_store.end().
+    auto it = list_store.find(key);
+
+    // If the key exists, return its stored list.
+    //
+    // it->second refers to the vector associated with the key.
+    // Because the function returns by value, the caller receives
+    // a copy rather than a reference to the internal vector.
+    if (it != list_store.end()) {
+        return it->second;
+    }
+
+    // The key does not exist in list_store.
+    //
+    // Return an empty vector to indicate that no list elements
+    // were found. The stored database remains unchanged.
+    return {};
+}
 
 /**
  * @brief Returns the number of elements stored in a list.
@@ -663,7 +978,15 @@ std::vector<std::string> RedisDatabase::list_range(const std::string& key, int s
     return result;
 }
 
-// hash operations
+
+/*
+ * Hash operations
+ *
+ * Each operation locks db_mutex before accessing hash_store.
+ * These methods do not invoke the expiration-cleanup helpers, so an expired
+ * hash key can remain accessible until another operation purges that key.
+ */
+
 
 /*
  * HSET — Set the value of a field inside a hash.
@@ -1014,6 +1337,29 @@ size_t RedisDatabase::hash_mset(const std::string& key, const std::vector<std::p
  * H = Hash
  */
 
+/**
+ * @brief Serializes the in-memory database into a text-based dump file.
+ *
+ * Acquires db_mutex while writing the database contents to the
+ * specified file. Each stored entry is written as a line with a
+ * one-character record type:
+ *
+ * K - String key-value entry.
+ * L - List key followed by its elements.
+ * H - Hash key followed by field:value tokens.
+ *
+ * @param filename Destination file path.
+ * @return false if the file cannot be opened; true after the write loops
+ *         complete.
+ *
+ * @note The current format is whitespace-delimited and does not
+ *       reliably preserve values containing spaces. Hash fields and
+ *       values containing colons are also ambiguous.
+ * @note Expiration timestamps are not persisted.
+ * @note The current implementation does not check the stream state
+ *       after writing, so a later write failure may go undetected.
+ */
+
 bool RedisDatabase::dump(const std::string &filename) {
     std::lock_guard<std::mutex> lock(db_mutex);
     std::ofstream ofs(filename, std::ios::binary);
@@ -1073,6 +1419,24 @@ bool RedisDatabase::dump(const std::string &filename) {
  * 
  */
 
+/**
+ * @brief Loads database contents from the custom text-based dump format.
+ *
+ * Opens the specified file and, if opening succeeds, clears the string,
+ * list, and hash stores. It then reads the file line by line and parses
+ * each record according to its K, L, or H type.
+ *
+ * @param filename Source file path.
+ * @return false if the file cannot be opened; true after the reading
+ *         loop completes.
+ *
+ * @note The current implementation does not clear expiry_map.
+ * @note The loader uses whitespace-delimited tokens and splits hash
+ *       tokens at the first colon. Data containing spaces or ambiguous
+ *       colons may not be restored correctly.
+ * @note Malformed records and stream errors are not fully validated.
+ */
+
 bool RedisDatabase::load(const std::string &filename) {
     std::lock_guard<std::mutex> lock(db_mutex);
     std::ifstream ifs(filename, std::ios::binary);
@@ -1081,6 +1445,10 @@ bool RedisDatabase::load(const std::string &filename) {
     kv_store.clear();
     list_store.clear();
     hash_store.clear();
+
+    // The dump format currently does not persist TTLs, so old expiration
+    // deadlines must not remain attached to keys loaded from the file.
+    expiry_map.clear();
 
     std::string line;
     while (std::getline(ifs, line)) {
